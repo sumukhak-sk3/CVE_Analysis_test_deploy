@@ -56,6 +56,15 @@ export const api = {
   },
   getCVE: (rid: string, cve: string) =>
     http<import("./types").CVEDetailEnvelope>(`/runs/${rid}/cves/${cve}`),
+  getPatch: (rid: string, cve: string) =>
+    http<{ repo_root: string; fix: import("./types").FixProposalView }>(
+      `/runs/${rid}/cves/${cve}/patch`,
+    ),
+  applyPatch: (rid: string, cve: string, checkOnly = false) =>
+    http<import("./types").ApplyPatchResult>(
+      `/runs/${rid}/cves/${cve}/apply_patch`,
+      { method: "POST", json: { check_only: checkOnly } },
+    ),
   getEvents: async (rid: string, sinceSeq = 0) => {
     const j = await http<{ events: import("./types").RunEvent[] }>(
       `/runs/${rid}/events?since_seq=${sinceSeq}`,

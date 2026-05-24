@@ -957,6 +957,125 @@ def create_app(config_path: str | None = None) -> FastAPI:
         return JSONResponse(envelope)
 
     # ------------------------------------------------------------------
+    # Apply / preview an authored patch against the indexed repo.
+    # ------------------------------------------------------------------
+
+    def _load_fix_proposal(run_id: str, cve_id: str) -> tuple[dict[str, Any], str]:
+        """Return (fix_proposal_dict, repo_root) or raise HTTPException."""
+        sm = _read_start_meta(cfg, run_id) or {}
+        repo_root = sm.get("repo_root")
+        if not repo_root:
+            raise HTTPException(
+                status_code=400,
+                detail="run has no repo_root recorded; cannot apply patch",
+            )
+        # Resolve analysis_id from registry then event stream.
+        analysis_id: str | None = None
+        st = runs.status(run_id) or {}
+        if isinstance(st.get("analysis_id"), str):
+            analysis_id = st["analysis_id"]
+        if not analysis_id:
+            for ev in _load_run_events(cfg, run_id):
+                d = ev.get("data") or {}
+                if isinstance(d.get("analysis_id"), str):
+                    analysis_id = d["analysis_id"]
+                    break
+        if not analysis_id:
+            raise HTTPException(status_code=404, detail="analysis not found")
+        fp_path = (
+            _artifacts_dir(cfg) / analysis_id / cve_id / "fix_proposal.json"
+        )
+        if not fp_path.exists():
+            raise HTTPException(
+                status_code=404, detail="no fix_proposal.json for this CVE"
+            )
+        try:
+            fp = json.loads(fp_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=500, detail=f"unreadable fix_proposal.json: {exc}"
+            ) from exc
+        return fp, str(repo_root)
+
+    @app.get("/runs/{run_id}/cves/{cve_id}/patch")
+    def get_run_cve_patch(run_id: str, cve_id: str) -> JSONResponse:
+        """Return the raw fix_proposal.json so the UI can render the diff."""
+        _validate_run_id(run_id)
+        _validate_cve_id(cve_id)
+        fp, repo_root = _load_fix_proposal(run_id, cve_id)
+        return JSONResponse({"repo_root": repo_root, "fix": fp})
+
+    @app.post("/runs/{run_id}/cves/{cve_id}/apply_patch")
+    def apply_run_cve_patch(
+        run_id: str, cve_id: str, payload: dict[str, Any] | None = None
+    ) -> JSONResponse:
+        """Apply the authored patch via `git apply` against the recorded repo_root.
+
+        Body (optional):
+          - check_only: bool — run `git apply --check` and do not modify files.
+        Returns a structured result so the UI can display stdout/stderr.
+        """
+        _validate_run_id(run_id)
+        _validate_cve_id(cve_id)
+        check_only = bool((payload or {}).get("check_only"))
+        fp, repo_root = _load_fix_proposal(run_id, cve_id)
+        diff = str(fp.get("patch_unified_diff") or "")
+        if not diff.strip():
+            raise HTTPException(status_code=400, detail="patch is empty")
+        repo_path = Path(repo_root)
+        if not repo_path.exists() or not repo_path.is_dir():
+            raise HTTPException(
+                status_code=400, detail=f"repo_root does not exist: {repo_root}"
+            )
+        # Require a git working tree so `git apply` semantics are well defined
+        # and operators can `git diff`/`git restore` to undo.
+        if not (repo_path / ".git").exists():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"repo_root is not a git working tree: {repo_root}. "
+                    "Initialise the repo or apply manually."
+                ),
+            )
+        cmd = ["git", "apply", "--whitespace=nowarn"]
+        if check_only:
+            cmd.append("--check")
+        try:
+            proc = subprocess.run(  # noqa: S603 - explicit list, no shell
+                cmd,
+                input=diff,
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=504, detail="git apply timed out")
+        ok = proc.returncode == 0
+        log_event(
+            logger,
+            "patch.apply" if not check_only else "patch.check",
+            run_id=run_id,
+            cve_id=cve_id,
+            repo_root=str(repo_path),
+            ok=ok,
+            files=fp.get("files_touched") or [],
+        )
+        return JSONResponse(
+            {
+                "ok": ok,
+                "check_only": check_only,
+                "repo_root": str(repo_path),
+                "files_touched": fp.get("files_touched") or [],
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "returncode": proc.returncode,
+            },
+            status_code=200 if ok else 409,
+        )
+
+    # ------------------------------------------------------------------
     # WebSocket: live event stream
     # ------------------------------------------------------------------
 

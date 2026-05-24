@@ -83,6 +83,26 @@ export interface CVEDetailEnvelope {
   [k: string]: any;
 }
 
+export interface FixProposalView {
+  patch_unified_diff: string;
+  files_touched: string[];
+  lines_added: number;
+  lines_removed: number;
+  rationale: string;
+  fix_confidence: number;
+  verdict_override?: string | null;
+}
+
+export interface ApplyPatchResult {
+  ok: boolean;
+  check_only: boolean;
+  repo_root: string;
+  files_touched: string[];
+  stdout: string;
+  stderr: string;
+  returncode: number;
+}
+
 export interface ModelsResponse {
   models: string[];
   author_default?: string | null;

@@ -238,6 +238,15 @@ class Orchestrator:
             set_analysis_id(analysis_id)
             cve_dir = ensure_dir(analysis_dir / event.cve_id.replace("/", "_"))
             t0 = time.monotonic()
+            log_event(
+                logger,
+                "analysis.cve_started",
+                cve_id=event.cve_id,
+                component=event.component.name,
+                version=event.component.current_version or "",
+                index=idx + 1,
+                total=len(request.cves),
+            )
             self._publish(
                 Events.CVE_STARTED,
                 cve_id=event.cve_id,
@@ -254,6 +263,18 @@ class Orchestrator:
                     log.extend(stage_log)
                 results[idx] = result
                 duration_ms = int((time.monotonic() - t0) * 1000)
+                log_event(
+                    logger,
+                    "analysis.cve_completed",
+                    cve_id=event.cve_id,
+                    component=event.component.name,
+                    version=event.component.current_version or "",
+                    final_verdict=result.routing.final_verdict.value,
+                    decision=result.routing.decision.value,
+                    duration_ms=duration_ms,
+                    index=idx + 1,
+                    total=len(request.cves),
+                )
                 self._publish(
                     Events.CVE_COMPLETED,
                     cve_id=event.cve_id,

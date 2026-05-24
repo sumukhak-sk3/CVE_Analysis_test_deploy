@@ -117,6 +117,7 @@ export default function CVEDetail() {
       {data && (
         <>
           <Summary fields={fields} />
+          <FixPatchPanel runId={runId!} cveId={cveId!} data={data} />
           <HITLPanel
             decision={decision}
             onSubmit={submitDecision}
@@ -639,6 +640,186 @@ function HITLPanel({
           </table>
         </>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Fix patch panel — renders the authored unified diff and lets a reviewer
+// either preview (`git apply --check`) or apply it (`git apply`) against the
+// indexed repo_root. We embed the diff directly so developers do not need to
+// drop to the shell to inspect what would change.
+// ---------------------------------------------------------------------------
+
+function FixPatchPanel({
+  runId,
+  cveId,
+  data,
+}: {
+  runId: string;
+  cveId: string;
+  data: any;
+}) {
+  const fix = data?.fix as
+    | undefined
+    | {
+        patch_unified_diff?: string;
+        files_touched?: string[];
+        lines_added?: number;
+        lines_removed?: number;
+        rationale?: string;
+        fix_confidence?: number;
+        verdict_override?: string | null;
+      };
+  const diff = (fix?.patch_unified_diff || "").trim();
+  const [busy, setBusy] = useState<null | "check" | "apply">(null);
+  const [result, setResult] = useState<
+    null | import("../types").ApplyPatchResult
+  >(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  if (!fix || !diff) {
+    return (
+      <div className="card">
+        <h3>Proposed fix</h3>
+        <div className="muted">
+          No code patch was authored for this CVE. (Only CVEs triaged as{" "}
+          <code>code_change</code> get a patch; <code>upgrade_only</code> and{" "}
+          <code>not_applicable</code> verdicts produce a recommendation only.)
+        </div>
+      </div>
+    );
+  }
+
+  async function run(checkOnly: boolean) {
+    setBusy(checkOnly ? "check" : "apply");
+    setErr(null);
+    setResult(null);
+    try {
+      const r = await api.applyPatch(runId, cveId, checkOnly);
+      setResult(r);
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div className="card">
+      <h3>Proposed fix</h3>
+      <dl className="kv">
+        <dt>Files touched</dt>
+        <dd>
+          {(fix.files_touched || []).length === 0 ? (
+            <span className="muted">none</span>
+          ) : (
+            <ul style={{ margin: 0, paddingLeft: 20 }}>
+              {(fix.files_touched || []).map((f) => (
+                <li key={f}>
+                  <code>{f}</code>
+                </li>
+              ))}
+            </ul>
+          )}
+        </dd>
+        <dt>Lines</dt>
+        <dd>
+          <span style={{ color: "#1a7f37" }}>+{fix.lines_added ?? 0}</span>{" "}
+          <span style={{ color: "#cf222e" }}>-{fix.lines_removed ?? 0}</span>
+        </dd>
+        {typeof fix.fix_confidence === "number" && (
+          <>
+            <dt>Confidence</dt>
+            <dd>{(fix.fix_confidence * 100).toFixed(0)}%</dd>
+          </>
+        )}
+        {fix.rationale && (
+          <>
+            <dt>Rationale</dt>
+            <dd>{safeText(fix.rationale)}</dd>
+          </>
+        )}
+      </dl>
+
+      <div className="row" style={{ gap: 8, margin: "8px 0" }}>
+        <button disabled={busy !== null} onClick={() => run(true)}>
+          {busy === "check" ? "Checking…" : "Preview (git apply --check)"}
+        </button>
+        <button
+          disabled={busy !== null}
+          onClick={() => {
+            if (
+              confirm(
+                "Apply this patch to the indexed repo working tree? " +
+                  "You can undo with `git restore` / `git checkout -- .` " +
+                  "in the repo.",
+              )
+            ) {
+              run(false);
+            }
+          }}
+        >
+          {busy === "apply" ? "Applying…" : "Apply to repo"}
+        </button>
+      </div>
+
+      {err && <div className="error">{err}</div>}
+      {result && (
+        <div
+          className={result.ok ? "" : "error"}
+          style={{ margin: "8px 0" }}
+        >
+          <strong>
+            {result.check_only
+              ? result.ok
+                ? "Patch applies cleanly."
+                : "Patch would NOT apply cleanly."
+              : result.ok
+              ? `Applied to ${result.repo_root}`
+              : `Apply failed (rc=${result.returncode})`}
+          </strong>
+          {result.stderr && (
+            <pre style={{ margin: "4px 0", whiteSpace: "pre-wrap" }}>
+              {result.stderr}
+            </pre>
+          )}
+          {result.stdout && (
+            <pre style={{ margin: "4px 0", whiteSpace: "pre-wrap" }}>
+              {result.stdout}
+            </pre>
+          )}
+        </div>
+      )}
+
+      <details open>
+        <summary className="muted">Unified diff</summary>
+        <pre
+          style={{
+            background: "#0d1117",
+            color: "#c9d1d9",
+            padding: 12,
+            borderRadius: 6,
+            overflowX: "auto",
+            fontSize: 12,
+            lineHeight: 1.45,
+          }}
+        >
+          {diff.split("\n").map((line, i) => {
+            let color = "#c9d1d9";
+            if (line.startsWith("+++") || line.startsWith("---"))
+              color = "#8b949e";
+            else if (line.startsWith("@@")) color = "#79c0ff";
+            else if (line.startsWith("+")) color = "#3fb950";
+            else if (line.startsWith("-")) color = "#f85149";
+            return (
+              <div key={i} style={{ color, whiteSpace: "pre" }}>
+                {line || " "}
+              </div>
+            );
+          })}
+        </pre>
+      </details>
     </div>
   );
 }
