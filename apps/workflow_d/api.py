@@ -46,13 +46,23 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 
@@ -69,6 +79,7 @@ logger = get_logger(__name__)
 _RUN_ID_RE = re.compile(r"^run-[a-f0-9]{6,32}$")
 _CVE_ID_RE = re.compile(r"^[A-Z]+-\d{4}-\d{3,10}$")
 _ANALYSIS_ID_RE = re.compile(r"^an-[a-f0-9]{6,32}$")
+_JENKINS_TICKET_RE = re.compile(r"^[a-f0-9]{10,32}$")
 
 
 def _resolve_config_path() -> str:
@@ -203,6 +214,43 @@ def _artifacts_dir(cfg: dict[str, Any]) -> Path:
 
 def _events_dir(cfg: dict[str, Any]) -> Path:
     return _runs_dir(cfg) / "events"
+
+
+def _jenkins_dir(cfg: dict[str, Any]) -> Path:
+    return _runs_dir(cfg) / "jenkins"
+
+
+def _jenkins_uploads_dir(cfg: dict[str, Any]) -> Path:
+    return _jenkins_dir(cfg) / "uploads"
+
+
+def _jenkins_upload_dir(cfg: dict[str, Any], ticket: str) -> Path:
+    return _jenkins_uploads_dir(cfg) / ticket
+
+
+def _jenkins_ticket_path(cfg: dict[str, Any], ticket: str) -> Path:
+    return _jenkins_dir(cfg) / f"{ticket}.json"
+
+
+def _jenkins_upload_meta_path(cfg: dict[str, Any], ticket: str) -> Path:
+    return _jenkins_upload_dir(cfg, ticket) / "meta.json"
+
+
+def _validate_jenkins_ticket(ticket: str) -> None:
+    if not _JENKINS_TICKET_RE.match(ticket):
+        raise HTTPException(status_code=400, detail="invalid ticket")
+
+
+def _jenkins_job_url(base_url: str, job_name: str) -> str:
+    parts = [p for p in (job_name or "").split("/") if p]
+    if not parts:
+        raise ValueError("jenkins.job_name is required")
+    encoded = "/".join(f"job/{urllib.parse.quote(p, safe='')}" for p in parts)
+    return f"{base_url.rstrip('/')}/{encoded}"
+
+
+def _request_base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
 
 
 def _indexes_root(cfg: dict[str, Any]) -> Path:
@@ -1482,34 +1530,258 @@ def create_app(config_path: str | None = None) -> FastAPI:
         return JSONResponse({"state": "running"}, status_code=202)
 
     # ------------------------------------------------------------------
-    # Jenkins trigger — placeholder; user wires actual trigger later
+    # Jenkins trigger + upload handoff
     # ------------------------------------------------------------------
 
-    @app.post("/jenkins/trigger")
-    def jenkins_trigger(payload: dict[str, Any]) -> JSONResponse:
-        """Stub endpoint. Accepts an sbom path and records the request.
+    @app.post("/jenkins/upload-sbom")
+    async def jenkins_upload_sbom(sbom_file: UploadFile = File(...)) -> JSONResponse:
+        """Accept an SBOM upload and persist it under .data/runs/jenkins/uploads.
 
-        Replace the body below with your Jenkins client when ready.
+        The returned ticket can then be passed to /jenkins/trigger.
         """
-        sbom_path = payload.get("sbom_path") or ""
-        if sbom_path and not Path(sbom_path).exists():
-            raise HTTPException(status_code=400, detail="sbom_path not found")
-        ticket = uuid.uuid4().hex[:10]
-        record = {
+        name = Path(sbom_file.filename or "sbom.yaml").name
+        if not name:
+            raise HTTPException(status_code=400, detail="empty filename")
+        suffix = Path(name).suffix.lower()
+        if suffix not in {".yaml", ".yml", ".json", ".xml"}:
+            raise HTTPException(status_code=400, detail="unsupported SBOM file extension")
+
+        content = await sbom_file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="empty file")
+
+        ticket = uuid.uuid4().hex[:12]
+        token = uuid.uuid4().hex
+        up_dir = _jenkins_upload_dir(cfg, ticket)
+        up_dir.mkdir(parents=True, exist_ok=True)
+        sbom_path = up_dir / name
+        sbom_path.write_bytes(content)
+
+        meta = {
             "ticket": ticket,
-            "received_at": time.time(),
-            "sbom_path": sbom_path,
-            "extra": {k: v for k, v in payload.items() if k != "sbom_path"},
-            "state": "queued",
-            "note": "Jenkins trigger not wired yet; replace this stub.",
+            "token": token,
+            "filename": name,
+            "content_type": sbom_file.content_type,
+            "stored_path": str(sbom_path),
+            "size_bytes": len(content),
+            "created_at": time.time(),
+            "state": "uploaded",
         }
-        out_dir = _runs_dir(cfg) / "jenkins"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / f"{ticket}.json").write_text(
+        _jenkins_upload_meta_path(cfg, ticket).write_text(
+            json.dumps(meta, indent=2), encoding="utf-8"
+        )
+        log_event(logger, "jenkins.upload_sbom", ticket=ticket, size=len(content))
+        return JSONResponse(
+            {
+                "ticket": ticket,
+                "filename": name,
+                "size_bytes": len(content),
+                "state": "uploaded",
+            },
+            status_code=201,
+        )
+
+    @app.get("/jenkins/uploads/{ticket}/sbom")
+    def jenkins_get_uploaded_sbom(
+        ticket: str, token: str = Query(default="")
+    ) -> FileResponse:
+        """Serves the uploaded SBOM to Jenkins using a ticket-scoped token."""
+        _validate_jenkins_ticket(ticket)
+        meta_path = _jenkins_upload_meta_path(cfg, ticket)
+        if not meta_path.exists():
+            raise HTTPException(status_code=404, detail="ticket not found")
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=500, detail=f"invalid upload meta: {exc}") from exc
+        if not token or token != meta.get("token"):
+            raise HTTPException(status_code=403, detail="invalid token")
+        sbom_path = Path(meta.get("stored_path") or "")
+        if not sbom_path.exists():
+            raise HTTPException(status_code=404, detail="uploaded SBOM missing")
+        return FileResponse(path=sbom_path, filename=meta.get("filename") or "sbom.yaml")
+
+    @app.post("/jenkins/trigger")
+    def jenkins_trigger(payload: dict[str, Any], request: Request) -> JSONResponse:
+        """Trigger a Jenkins job for end-to-end SBOM -> CVE analysis.
+
+        Supported input modes:
+          * payload["ticket"]: previously uploaded file from /jenkins/upload-sbom
+          * payload["sbom_path"]: server-local path (advanced/manual)
+        """
+        jcfg = (cfg.get("jenkins") or {})
+        jbase = (payload.get("jenkins_url") or jcfg.get("base_url") or "").strip()
+        jjob = (payload.get("job_name") or jcfg.get("job_name") or "").strip()
+        if not jbase or not jjob:
+            raise HTTPException(
+                status_code=400,
+                detail="Jenkins not configured; set jenkins.base_url and jenkins.job_name",
+            )
+
+        ticket = (payload.get("ticket") or "").strip()
+        sbom_source = "uploaded"
+        sbom_upload_url = ""
+        sbom_upload_token = ""
+        sbom_filename = "sbom.yaml"
+        sbom_path = ""
+
+        if ticket:
+            _validate_jenkins_ticket(ticket)
+            meta_path = _jenkins_upload_meta_path(cfg, ticket)
+            if not meta_path.exists():
+                raise HTTPException(status_code=404, detail="ticket not found")
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=500, detail=f"invalid upload meta: {exc}") from exc
+            public_api_base = (
+                (payload.get("public_api_base") or "").strip()
+                or (jcfg.get("public_api_base") or "").strip()
+                or _request_base_url(request)
+            )
+            sbom_upload_token = str(meta.get("token") or "")
+            sbom_filename = str(meta.get("filename") or "sbom.yaml")
+            if not sbom_upload_token:
+                raise HTTPException(status_code=500, detail="upload token missing")
+            sbom_upload_url = (
+                f"{public_api_base.rstrip('/')}/jenkins/uploads/{ticket}/sbom"
+                f"?token={urllib.parse.quote(sbom_upload_token, safe='')}"
+            )
+        else:
+            sbom_path = (payload.get("sbom_path") or "").strip()
+            if not sbom_path:
+                raise HTTPException(status_code=400, detail="ticket or sbom_path is required")
+            if not Path(sbom_path).exists():
+                raise HTTPException(status_code=400, detail="sbom_path not found")
+            sbom_source = "workspace"
+
+        severities_raw = payload.get("severities")
+        if isinstance(severities_raw, list):
+            severities = ",".join(str(s).strip().upper() for s in severities_raw if str(s).strip())
+        else:
+            severities = str(severities_raw or "CRITICAL,HIGH")
+
+        params = {
+            "SBOM_SOURCE": sbom_source,
+            "SBOM_UPLOAD_URL": sbom_upload_url,
+            "SBOM_UPLOAD_TOKEN": sbom_upload_token,
+            "SBOM_FILENAME": sbom_filename,
+            "SBOM_PATH": sbom_path,
+            "DTRACK_URL": str(
+                payload.get("dtrack_url")
+                or jcfg.get("dtrack_url")
+                or cfg.get("dtrack", {}).get("base_url")
+                or ""
+            ),
+            "SECOND_SERVICE_API_URL": str(
+                payload.get("analysis_api_url")
+                or jcfg.get("second_service_api_url")
+                or ""
+            ),
+            "ANALYSIS_REPO_ROOT": str(
+                payload.get("repo_root")
+                or jcfg.get("analysis_repo_root")
+                or cfg.get("coderag", {}).get("default_repo_root")
+                or ""
+            ),
+            "WORKFLOW_MODE": str(payload.get("mode") or jcfg.get("mode") or "standard"),
+            "SEVERITIES": severities,
+            "LIMIT": str(payload.get("limit") or ""),
+            "WAIT_MINUTES": str(payload.get("wait_minutes") or jcfg.get("wait_minutes") or 30),
+            "OUTPUT_SUBDIR": str(payload.get("output_subdir") or ticket or uuid.uuid4().hex[:8]),
+        }
+
+        trigger_token = (
+            (payload.get("jenkins_trigger_token") or "").strip()
+            or (jcfg.get("trigger_token") or "").strip()
+        )
+        if trigger_token:
+            params["token"] = trigger_token
+
+        def _auth_header() -> dict[str, str]:
+            user = (payload.get("jenkins_user") or jcfg.get("user") or "").strip()
+            tok = (payload.get("jenkins_api_token") or jcfg.get("api_token") or "").strip()
+            if not user or not tok:
+                return {}
+            basic = base64.b64encode(f"{user}:{tok}".encode("utf-8")).decode("ascii")
+            return {"Authorization": f"Basic {basic}"}
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json,text/plain,*/*",
+        }
+        headers.update(_auth_header())
+
+        # Best-effort crumb support for Jenkins setups that require CSRF crumbs.
+        try:
+            crumb_req = urllib.request.Request(
+                f"{jbase.rstrip('/')}/crumbIssuer/api/json",
+                headers=headers,
+                method="GET",
+            )
+            with urllib.request.urlopen(crumb_req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                crumb_field = body.get("crumbRequestField")
+                crumb = body.get("crumb")
+                if crumb_field and crumb:
+                    headers[str(crumb_field)] = str(crumb)
+        except Exception:  # noqa: BLE001
+            pass
+
+        build_url = f"{_jenkins_job_url(jbase, jjob)}/buildWithParameters"
+        encoded = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode("utf-8")
+        record: dict[str, Any] = {
+            "ticket": ticket or uuid.uuid4().hex[:10],
+            "received_at": time.time(),
+            "state": "queued",
+            "jenkins_url": jbase,
+            "job_name": jjob,
+            "params": {k: (v if k not in {"SBOM_UPLOAD_TOKEN"} else "***") for k, v in params.items()},
+            "sbom_source": sbom_source,
+            "sbom_path": sbom_path,
+            "sbom_upload_url": sbom_upload_url,
+        }
+
+        try:
+            req = urllib.request.Request(build_url, data=encoded, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                queue_url = resp.headers.get("Location")
+                record["state"] = "queued"
+                record["http_status"] = getattr(resp, "status", 201)
+                if queue_url:
+                    record["queue_url"] = queue_url
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:1200]
+            record["state"] = "failed"
+            record["http_status"] = exc.code
+            record["error"] = detail or str(exc)
+            _jenkins_dir(cfg).mkdir(parents=True, exist_ok=True)
+            _jenkins_ticket_path(cfg, record["ticket"]).write_text(
+                json.dumps(record, indent=2), encoding="utf-8"
+            )
+            log_event(logger, "jenkins.trigger_failed", ticket=record["ticket"], error=record.get("error"))
+            raise HTTPException(status_code=502, detail=f"jenkins trigger failed: HTTP {exc.code}") from exc
+        except Exception as exc:  # noqa: BLE001
+            record["state"] = "failed"
+            record["error"] = str(exc)
+            _jenkins_dir(cfg).mkdir(parents=True, exist_ok=True)
+            _jenkins_ticket_path(cfg, record["ticket"]).write_text(
+                json.dumps(record, indent=2), encoding="utf-8"
+            )
+            log_event(logger, "jenkins.trigger_failed", ticket=record["ticket"], error=record.get("error"))
+            raise HTTPException(status_code=502, detail=f"jenkins trigger failed: {exc}") from exc
+
+        _jenkins_dir(cfg).mkdir(parents=True, exist_ok=True)
+        _jenkins_ticket_path(cfg, record["ticket"]).write_text(
             json.dumps(record, indent=2), encoding="utf-8"
         )
-        log_event(logger, "jenkins.trigger_stub",
-                  ticket=ticket, sbom_path=sbom_path)
+        log_event(
+            logger,
+            "jenkins.triggered",
+            ticket=record["ticket"],
+            sbom_source=sbom_source,
+            queue_url=record.get("queue_url"),
+        )
         return JSONResponse(record, status_code=202)
 
     # ------------------------------------------------------------------

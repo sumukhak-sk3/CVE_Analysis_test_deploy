@@ -103,8 +103,33 @@ export const api = {
   indexBuild: (payload: Record<string, unknown>) =>
     http<{ state: string }>("/index/build", { method: "POST", json: payload }),
 
+  jenkinsUploadSbom: async (file: File) => {
+    const fd = new FormData();
+    fd.append("sbom_file", file);
+    const res = await fetch(API_BASE + "/jenkins/upload-sbom", {
+      method: "POST",
+      body: fd,
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const j = await res.json();
+        detail = j?.detail ?? JSON.stringify(j);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`${res.status} ${detail}`);
+    }
+    return (await res.json()) as {
+      ticket: string;
+      filename: string;
+      size_bytes: number;
+      state: string;
+    };
+  },
+
   jenkinsTrigger: (payload: Record<string, unknown>) =>
-    http<{ ticket: string; state: string }>("/jenkins/trigger", {
+    http<{ ticket: string; state: string; queue_url?: string }>("/jenkins/trigger", {
       method: "POST",
       json: payload,
     }),
