@@ -5,7 +5,7 @@ export default function JenkinsPage() {
   const [sbomFile, setSbomFile] = useState<File | null>(null);
   const [jenkinsUrl, setJenkinsUrl] = useState("");
   const [jobName, setJobName] = useState("");
-  const [dtrackUrl, setDtrackUrl] = useState("http://10.120.23.60:8081");
+  const [dtrackUrl, setDtrackUrl] = useState("http://localhost:8081");
   const [analysisApiUrl, setAnalysisApiUrl] = useState("http://10.120.23.89:8088");
   const [repoRoot, setRepoRoot] = useState("");
   const [waitMinutes, setWaitMinutes] = useState("30");
@@ -90,7 +90,7 @@ export default function JenkinsPage() {
             <input
               value={dtrackUrl}
               onChange={(e) => setDtrackUrl(e.target.value)}
-              placeholder="http://10.120.23.60:8081"
+              placeholder="http://localhost:8081"
               style={{ width: "100%" }}
             />
           </div>
