@@ -708,10 +708,96 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 runs_path.write_text(
                     json.dumps(summary, indent=2, default=str), encoding="utf-8"
                 )
+
+                # ---- Assemble <run_id>.full.json for XLSX export ---------
+                # The CLI run_pipeline.py writes this same shape; without
+                # it the GET /runs/{rid}/report.xlsx endpoint 404s. We
+                # synthesise a minimal but compatible run_artifact and
+                # collect per-CVE evidence bundles from disk.
+                try:
+                    analysis_dir = _artifacts_dir(cfg) / resp.analysis_id
+                    started_ts = start_meta.get("started_at")
+                    run_artifact_dict: dict[str, Any] = {
+                        "run_id": run_id,
+                        "status": "ok",  # backfilled below if cancelled
+                        "started_at": started_ts,
+                        "ended_at": time.time(),
+                        "repo_root": str(repo_root) if repo_root else None,
+                        "pipeline_stages_executed": ["analyze"],
+                        "files_changed": 0,
+                        "index_update": {},
+                        "ubuntu_security_api_results": [],
+                    }
+                    evidence_bundles: dict[str, Any] = {}
+                    for r in resp.results:
+                        bp = analysis_dir / r.cve_id.replace("/", "_") / "evidence_bundle.json"
+                        if bp.exists():
+                            try:
+                                evidence_bundles[r.cve_id] = json.loads(
+                                    bp.read_text(encoding="utf-8")
+                                )
+                            except (OSError, json.JSONDecodeError):
+                                pass
+                        # Surface Ubuntu enrichment in run_artifact so the
+                        # XLSX "Ubuntu Status" columns populate.
+                        bundle = evidence_bundles.get(r.cve_id) or {}
+                        ubu = (bundle.get("advisory_status") or {}).get("ubuntu") or {}
+                        if ubu.get("queried"):
+                            run_artifact_dict["ubuntu_security_api_results"].append({
+                                "cve_id": r.cve_id,
+                                "ok": ubu.get("ok"),
+                                "status": ubu.get("status"),
+                                "priority": ubu.get("priority"),
+                                "usn_ids": ubu.get("usn_ids") or [],
+                                "fixed_version": ubu.get("fixed_version"),
+                                "source": ubu.get("source"),
+                            })
+                    analysis_log: Any = None
+                    log_path = analysis_dir / "analysis_log.json"
+                    if log_path.exists():
+                        try:
+                            analysis_log = json.loads(
+                                log_path.read_text(encoding="utf-8")
+                            )
+                        except (OSError, json.JSONDecodeError):
+                            analysis_log = None
+                    full_report = {
+                        "run_artifact": run_artifact_dict,
+                        "analysis_id": resp.analysis_id,
+                        "analysis_dir": str(analysis_dir),
+                        "analysis_result": resp.model_dump(mode="json"),
+                        "evidence_bundles": evidence_bundles,
+                        "analysis_log": analysis_log,
+                    }
+                    full_path = _runs_dir(cfg) / f"{run_id}.full.json"
+                    full_path.write_text(
+                        json.dumps(full_report, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    log_event(logger, "run.full_report_written",
+                              run_id=run_id, path=str(full_path),
+                              bundles=len(evidence_bundles))
+                except Exception as exc:  # noqa: BLE001
+                    log_event(logger, "run.full_report_failed",
+                              run_id=run_id, error=str(exc))
+
                 # If the run was cancelled cooperatively, surface that as
                 # the registry state so the dashboard renders correctly.
                 tok = runs.cancel_token(run_id)
                 final_state = "cancelled" if (tok and tok.is_set()) else "ok"
+                # Backfill the actual status into the full report now that
+                # we know whether the run was cancelled.
+                try:
+                    full_path = _runs_dir(cfg) / f"{run_id}.full.json"
+                    if full_path.exists():
+                        fr = json.loads(full_path.read_text(encoding="utf-8"))
+                        fr.setdefault("run_artifact", {})["status"] = final_state
+                        full_path.write_text(
+                            json.dumps(fr, indent=2, default=str),
+                            encoding="utf-8",
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
                 runs.mark_done(run_id, final_state,
                                analysis_id=resp.analysis_id, total=resp.total)
             except Exception as exc:  # noqa: BLE001
