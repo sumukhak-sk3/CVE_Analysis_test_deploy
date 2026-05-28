@@ -6,11 +6,15 @@ pipeline {
   options {
     timestamps()
     disableConcurrentBuilds()
+    skipDefaultCheckout(true)
     timeout(time: 120, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
   parameters {
+    string(name: 'PIPELINE_REPO_URL', defaultValue: 'https://github.com/sumukhak-sk3/CVE_Analysis_test_deploy.git', description: 'Repository containing this Jenkinsfile and pipeline scripts.')
+    string(name: 'PIPELINE_REPO_BRANCH', defaultValue: 'main', description: 'Branch for PIPELINE_REPO_URL checkout.')
+    string(name: 'PIPELINE_GIT_CREDENTIALS_ID', defaultValue: 'github-private-repo-cred', description: 'Jenkins credentials ID used to clone PIPELINE_REPO_URL.')
     string(name: 'REPOSITORY_URL', defaultValue: '', description: 'Required: Git URL of the repository to index/analyze.')
     string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to checkout from REPOSITORY_URL.')
     string(name: 'VULNERABILITIES_FILE_URL', defaultValue: '', description: 'Optional: HTTP/HTTPS URL Jenkins can download (.json/.csv/.xlsx).')
@@ -36,6 +40,15 @@ pipeline {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
           mkdir -p "$RUN_ROOT" "$LOG_DIR"
+
+          if [[ -z "${PIPELINE_REPO_URL:-}" ]]; then
+            echo "ERROR: PIPELINE_REPO_URL is required" >&2
+            exit 1
+          fi
+          if [[ -z "${PIPELINE_REPO_BRANCH:-}" ]]; then
+            echo "ERROR: PIPELINE_REPO_BRANCH is required" >&2
+            exit 1
+          fi
 
           if [[ -z "${REPOSITORY_URL:-}" ]]; then
             echo "ERROR: REPOSITORY_URL is required" >&2
@@ -95,7 +108,16 @@ EOF
 
     stage('Checkout Pipeline Repo') {
       steps {
-        checkout scm
+        checkout([
+          $class: 'GitSCM',
+          branches: [[name: "*/${params.PIPELINE_REPO_BRANCH}"]],
+          doGenerateSubmoduleConfigurations: false,
+          extensions: [[$class: 'CleanBeforeCheckout']],
+          userRemoteConfigs: [[
+            url: params.PIPELINE_REPO_URL,
+            credentialsId: params.PIPELINE_GIT_CREDENTIALS_ID,
+          ]],
+        ])
       }
     }
 
@@ -322,7 +344,15 @@ PY
 
   post {
     always {
-      archiveArtifacts artifacts: '.jenkins_work/**', fingerprint: true, onlyIfSuccessful: false
+      script {
+        node('ubuntu_bin2') {
+          if (fileExists('.jenkins_work')) {
+            archiveArtifacts artifacts: '.jenkins_work/**', fingerprint: true, onlyIfSuccessful: false
+          } else {
+            echo 'No .jenkins_work directory found; skipping artifact archive.'
+          }
+        }
+      }
     }
     failure {
       echo 'Pipeline failed. Inspect archived logs under .jenkins_work/logs/ and run artifacts under .jenkins_work/run-*/.'
