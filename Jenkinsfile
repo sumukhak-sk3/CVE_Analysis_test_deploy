@@ -1,5 +1,7 @@
 pipeline {
-  agent any
+  agent {
+    label 'ubuntu_bin2'
+  }
 
   options {
     timestamps()
@@ -9,23 +11,23 @@ pipeline {
   }
 
   parameters {
-    string(
-      name: 'SBOM_UPLOAD_URL',
-      defaultValue: '',
-      description: 'Required: backend-generated SBOM URL for Jenkins handoff.'
-    )
+    string(name: 'REPOSITORY_URL', defaultValue: '', description: 'Required: Git URL of the repository to index/analyze.')
+    string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to checkout from REPOSITORY_URL.')
+    string(name: 'VULNERABILITIES_FILE_URL', defaultValue: '', description: 'Optional: HTTP/HTTPS URL Jenkins can download (.json/.csv/.xlsx).')
+    string(name: 'VULNERABILITIES_FILE_PATH', defaultValue: '', description: 'Optional: file path available on the Jenkins agent (workspace/shared mount).')
+    string(name: 'INDEX_NAME', defaultValue: '', description: 'Optional: custom index folder name. Auto-generated if empty.')
+    choice(name: 'INDEX_MODE', choices: ['full', 'incremental'], description: 'Index build mode for scripts/build_index.py.')
+    choice(name: 'ANALYSIS_MODE', choices: ['standard', 'urgent', 'ad_hoc'], description: 'Workflow D analysis mode.')
+    string(name: 'SEVERITIES', defaultValue: 'CRITICAL,HIGH', description: 'Comma-separated severities for filtering findings.')
+    string(name: 'LIMIT', defaultValue: '0', description: 'Maximum CVEs to analyze. Use 0 for no cap.')
+    string(name: 'WORKERS', defaultValue: '4', description: 'Parallel CVE workers for run_pipeline.')
+    string(name: 'OUTPUT_DIR', defaultValue: '.jenkins_work/output', description: 'Output directory (absolute or workspace-relative).')
   }
 
   environment {
     RUN_ROOT = "${WORKSPACE}/.jenkins_work"
     LOG_DIR = "${WORKSPACE}/.jenkins_work/logs"
     PYTHON_BIN = 'python3'
-    DTRACK_URL = 'http://localhost:8081'
-    DTRACK_CREDENTIALS_ID = 'dtrack-api-key'
-    WAIT_MINUTES = '30'
-    SECOND_SERVICE_API_URL = 'http://10.120.23.89:8088'
-    WORKFLOW_MODE = 'standard'
-    SEVERITIES = 'CRITICAL,HIGH'
   }
 
   stages {
@@ -35,71 +37,141 @@ pipeline {
           set -euo pipefail
           mkdir -p "$RUN_ROOT" "$LOG_DIR"
 
-          if [[ -z "${WAIT_MINUTES:-}" || ! "$WAIT_MINUTES" =~ ^[0-9]+$ || "$WAIT_MINUTES" -le 0 ]]; then
-            echo "ERROR: WAIT_MINUTES must be a positive integer" >&2
+          if [[ -z "${REPOSITORY_URL:-}" ]]; then
+            echo "ERROR: REPOSITORY_URL is required" >&2
             exit 1
           fi
-          if [[ -z "${SBOM_UPLOAD_URL:-}" ]]; then
-            echo "ERROR: SBOM_UPLOAD_URL is required" >&2
+          if [[ -z "${BRANCH:-}" ]]; then
+            echo "ERROR: BRANCH is required" >&2
             exit 1
           fi
-          if [[ -z "${DTRACK_URL:-}" ]]; then
-            echo "ERROR: DTRACK_URL is required" >&2
+          if [[ -z "${VULNERABILITIES_FILE_URL:-}" && -z "${VULNERABILITIES_FILE_PATH:-}" ]]; then
+            echo "ERROR: Provide either VULNERABILITIES_FILE_URL or VULNERABILITIES_FILE_PATH" >&2
             exit 1
           fi
-          if [[ -z "${SECOND_SERVICE_API_URL:-}" ]]; then
-            echo "ERROR: SECOND_SERVICE_API_URL is required" >&2
+
+          if [[ ! "${LIMIT:-}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: LIMIT must be a non-negative integer" >&2
             exit 1
           fi
-          if [[ -z "${DTRACK_CREDENTIALS_ID:-}" ]]; then
-            echo "ERROR: DTRACK_CREDENTIALS_ID is required" >&2
+
+          if [[ ! "${WORKERS:-}" =~ ^[0-9]+$ || "${WORKERS:-}" -le 0 ]]; then
+            echo "ERROR: WORKERS must be a positive integer" >&2
             exit 1
           fi
 
           RUN_DIR="$RUN_ROOT/run-${BUILD_NUMBER}"
-          SBOM_LOCAL_PATH="$RUN_DIR/input/sbom.yaml"
-          FINDINGS_JSON="$RUN_DIR/output/findings.json"
-          NORMALIZED_JSON="$RUN_DIR/output/normalized_payload.json"
-          FINAL_ANALYSIS_JSON="$RUN_DIR/output/final_analysis.json"
+          INPUT_DIR="$RUN_DIR/input"
+          TARGET_REPO_DIR="$RUN_DIR/target_repo"
+          RUNS_DIR="$RUN_DIR/runs"
+          INDEXES_DIR="$RUN_DIR/indexes"
 
-          mkdir -p "$RUN_DIR/input" "$RUN_DIR/output" "$LOG_DIR"
+          if [[ -n "${OUTPUT_DIR:-}" ]]; then
+            if [[ "${OUTPUT_DIR}" = /* ]]; then
+              OUTPUT_DIR_ABS="$OUTPUT_DIR"
+            else
+              OUTPUT_DIR_ABS="$WORKSPACE/$OUTPUT_DIR"
+            fi
+          else
+            OUTPUT_DIR_ABS="$RUN_DIR/output"
+          fi
+
+          mkdir -p "$INPUT_DIR" "$TARGET_REPO_DIR" "$RUNS_DIR" "$INDEXES_DIR" "$OUTPUT_DIR_ABS" "$LOG_DIR"
 
           cat > "$RUN_ROOT/run.env" <<EOF
 export RUN_DIR="$RUN_DIR"
-export SBOM_LOCAL_PATH="$SBOM_LOCAL_PATH"
-export FINDINGS_JSON="$FINDINGS_JSON"
-export NORMALIZED_JSON="$NORMALIZED_JSON"
-export FINAL_ANALYSIS_JSON="$FINAL_ANALYSIS_JSON"
+export INPUT_DIR="$INPUT_DIR"
+export TARGET_REPO_DIR="$TARGET_REPO_DIR"
+export RUNS_DIR="$RUNS_DIR"
+export INDEXES_DIR="$INDEXES_DIR"
+export OUTPUT_DIR_ABS="$OUTPUT_DIR_ABS"
 EOF
 
           echo "RUN_DIR=$RUN_DIR"
-          echo "SBOM_LOCAL_PATH=$SBOM_LOCAL_PATH"
+          echo "OUTPUT_DIR_ABS=$OUTPUT_DIR_ABS"
         '''
       }
     }
 
-    stage('Checkout') {
+    stage('Checkout Pipeline Repo') {
       steps {
         checkout scm
       }
     }
 
-    stage('Acquire SBOM') {
+    stage('Acquire Vulnerabilities File') {
       options { timeout(time: 10, unit: 'MINUTES') }
       steps {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-          echo "Downloading uploaded SBOM from backend handoff URL"
-          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
-            "$SBOM_UPLOAD_URL" -o "$SBOM_LOCAL_PATH"
+          SRC_NAME=""
 
-          if [[ ! -s "$SBOM_LOCAL_PATH" ]]; then
-            echo "ERROR: SBOM file is empty or missing: $SBOM_LOCAL_PATH" >&2
+          if [[ -n "${VULNERABILITIES_FILE_URL:-}" ]]; then
+            echo "Downloading vulnerabilities file from URL"
+            SRC_NAME="$(basename "${VULNERABILITIES_FILE_URL%%\?*}")"
+            [[ -n "$SRC_NAME" ]] || SRC_NAME="vulnerabilities.json"
+            EXT_LOWER="$(echo "${SRC_NAME##*.}" | tr '[:upper:]' '[:lower:]')"
+            VULNS_LOCAL_PATH="$INPUT_DIR/vulnerabilities.${EXT_LOWER}"
+            curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+              "$VULNERABILITIES_FILE_URL" -o "$VULNS_LOCAL_PATH"
+          else
+            SRC_PATH="$VULNERABILITIES_FILE_PATH"
+            if [[ "$SRC_PATH" != /* ]]; then
+              SRC_PATH="$WORKSPACE/$SRC_PATH"
+            fi
+            if [[ ! -f "$SRC_PATH" ]]; then
+              echo "ERROR: VULNERABILITIES_FILE_PATH does not exist on Jenkins agent: $SRC_PATH" >&2
+              exit 1
+            fi
+            SRC_NAME="$(basename "$SRC_PATH")"
+            EXT_LOWER="$(echo "${SRC_NAME##*.}" | tr '[:upper:]' '[:lower:]')"
+            VULNS_LOCAL_PATH="$INPUT_DIR/vulnerabilities.${EXT_LOWER}"
+            cp "$SRC_PATH" "$VULNS_LOCAL_PATH"
+          fi
+
+          if [[ ! -s "$VULNS_LOCAL_PATH" ]]; then
+            echo "ERROR: Vulnerabilities file is empty or missing: $VULNS_LOCAL_PATH" >&2
             exit 1
           fi
-          echo "SBOM ready: $SBOM_LOCAL_PATH"
+
+          case "$EXT_LOWER" in
+            json|csv|xlsx|xlsm) ;;
+            *)
+              echo "ERROR: vulnerabilities file extension must be .json/.csv/.xlsx/.xlsm" >&2
+              exit 1
+              ;;
+          esac
+
+          cat >> "$RUN_ROOT/run.env" <<EOF
+export VULNS_LOCAL_PATH="$VULNS_LOCAL_PATH"
+EOF
+
+          echo "VULNS_LOCAL_PATH=$VULNS_LOCAL_PATH"
+        '''
+      }
+    }
+
+    stage('Clone Target Repository') {
+      options { timeout(time: 20, unit: 'MINUTES') }
+      steps {
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          source "$RUN_ROOT/run.env"
+
+          if [[ -d "$TARGET_REPO_DIR/.git" ]]; then
+            rm -rf "$TARGET_REPO_DIR"
+          fi
+
+          echo "Cloning target repository: ${REPOSITORY_URL} (branch: ${BRANCH})"
+          git clone --depth 1 --branch "$BRANCH" -- "$REPOSITORY_URL" "$TARGET_REPO_DIR" \
+            2>&1 | tee "$LOG_DIR/git_clone.log"
+
+          if [[ ! -d "$TARGET_REPO_DIR/.git" ]]; then
+            echo "ERROR: target repository clone failed" >&2
+            exit 1
+          fi
         '''
       }
     }
@@ -111,81 +183,109 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
           "$PYTHON_BIN" -m pip install --upgrade pip
-          "$PYTHON_BIN" -m pip install -r requirements.txt
+          "$PYTHON_BIN" -m pip install -r requirements.txt 2>&1 | tee "$LOG_DIR/pip_install.log"
         '''
       }
     }
 
-    stage('Run Dependency-Track Ingestion') {
-      options { timeout(time: 80, unit: 'MINUTES') }
-      steps {
-        withCredentials([
-          string(credentialsId: env.DTRACK_CREDENTIALS_ID, variable: 'DTRACK_API_KEY')
-        ]) {
-          sh '''#!/usr/bin/env bash
-            set -euo pipefail
-            source "$RUN_ROOT/run.env"
-
-            "$PYTHON_BIN" Dependency_Track_Final_2.py \
-              --sbom-file "$SBOM_LOCAL_PATH" \
-              --dtrack-url "$DTRACK_URL" \
-              --dtrack-api-key "$DTRACK_API_KEY" \
-              --wait-minutes "$WAIT_MINUTES" \
-              --output-findings-json "$FINDINGS_JSON" \
-              2>&1 | tee "$LOG_DIR/dependency_track.log"
-          '''
-        }
-      }
-    }
-
-    stage('Validate Findings JSON') {
-      steps {
-        sh '''#!/usr/bin/env bash
-          set -euo pipefail
-          source "$RUN_ROOT/run.env"
-          "$PYTHON_BIN" - <<PY
-import json
-from pathlib import Path
-
-p = Path("$FINDINGS_JSON")
-if not p.exists() or p.stat().st_size == 0:
-    raise SystemExit(f"Findings JSON missing or empty: {p}")
-
-obj = json.loads(p.read_text(encoding="utf-8"))
-if not isinstance(obj, dict):
-    raise SystemExit("Findings JSON must be an object")
-
-findings = obj.get("findings")
-if not isinstance(findings, list) or not findings:
-    raise SystemExit("Findings JSON must contain a non-empty 'findings' array")
-
-for i, row in enumerate(findings[:3]):
-    if not isinstance(row, dict):
-        raise SystemExit(f"findings[{i}] is not an object")
-    if "vulnerability" not in row or "component" not in row:
-        raise SystemExit(f"findings[{i}] missing vulnerability/component keys")
-
-print(f"Validated findings JSON with {len(findings)} entries")
-PY
-        '''
-      }
-    }
-
-    stage('Submit Findings To Workflow D') {
-      options { timeout(time: 30, unit: 'MINUTES') }
+    stage('Build Code Index') {
+      options { timeout(time: 40, unit: 'MINUTES') }
       steps {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-          "$PYTHON_BIN" scripts/submit_findings_to_workflow_d.py \
-            --vulns "$FINDINGS_JSON" \
-            --api "$SECOND_SERVICE_API_URL" \
-            --mode "$WORKFLOW_MODE" \
-            --severities "$SEVERITIES" \
-            --out "$FINAL_ANALYSIS_JSON" \
-            --normalized-out "$NORMALIZED_JSON" \
-            2>&1 | tee "$LOG_DIR/workflow_submit.log"
+          if [[ -n "${INDEX_NAME:-}" ]]; then
+            SAFE_INDEX_NAME="$(echo "$INDEX_NAME" | tr -cs 'A-Za-z0-9._-' '-')"
+          else
+            REPO_BASE="$(basename "$REPOSITORY_URL")"
+            REPO_BASE="${REPO_BASE%.git}"
+            SAFE_INDEX_NAME="$(echo "${REPO_BASE}-${BRANCH}-${BUILD_NUMBER}" | tr -cs 'A-Za-z0-9._-' '-')"
+          fi
+          INDEX_DIR="$INDEXES_DIR/$SAFE_INDEX_NAME"
+          mkdir -p "$INDEX_DIR"
+
+          "$PYTHON_BIN" scripts/build_index.py \
+            --repo "$TARGET_REPO_DIR" \
+            --out "$INDEX_DIR" \
+            --mode "$INDEX_MODE" \
+            2>&1 | tee "$LOG_DIR/index_build.log"
+
+          if [[ ! -s "$INDEX_DIR/meta.json" ]]; then
+            echo "ERROR: index build did not produce meta.json in $INDEX_DIR" >&2
+            exit 1
+          fi
+
+          cat >> "$RUN_ROOT/run.env" <<EOF
+export INDEX_DIR="$INDEX_DIR"
+EOF
+
+          echo "INDEX_DIR=$INDEX_DIR"
+        '''
+      }
+    }
+
+    stage('Run Vulnerability Analysis') {
+      options { timeout(time: 90, unit: 'MINUTES') }
+      steps {
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          source "$RUN_ROOT/run.env"
+
+          SEV_ARGS=()
+          IFS=',' read -r -a RAW_SEVS <<< "${SEVERITIES:-CRITICAL,HIGH}"
+          for s in "${RAW_SEVS[@]}"; do
+            v="$(echo "$s" | xargs)"
+            if [[ -n "$v" ]]; then
+              SEV_ARGS+=("$v")
+            fi
+          done
+
+          "$PYTHON_BIN" scripts/run_pipeline.py \
+            --repo-root "$TARGET_REPO_DIR" \
+            --vulns "$VULNS_LOCAL_PATH" \
+            --index-dir "$INDEX_DIR" \
+            --force-all \
+            --hitl-mode non_interactive \
+            --mode "$ANALYSIS_MODE" \
+            --limit "$LIMIT" \
+            --workers "$WORKERS" \
+            --runs-dir "$RUNS_DIR" \
+            --severities "${SEV_ARGS[@]}" \
+            2>&1 | tee "$LOG_DIR/run_pipeline.log"
+        '''
+      }
+    }
+
+    stage('Generate Excel Report') {
+      steps {
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          source "$RUN_ROOT/run.env"
+
+          FULL_REPORT="$(ls -1t "$RUNS_DIR"/run-*.full.json 2>/dev/null | head -n 1 || true)"
+          if [[ -z "$FULL_REPORT" ]]; then
+            echo "ERROR: No run-*.full.json found in $RUNS_DIR" >&2
+            exit 1
+          fi
+
+          RUN_ID="$(basename "$FULL_REPORT" .full.json)"
+          XLSX_PATH="$OUTPUT_DIR_ABS/${RUN_ID}.xlsx"
+
+          "$PYTHON_BIN" scripts/export_report_xlsx.py \
+            --report "$FULL_REPORT" \
+            --out "$XLSX_PATH" \
+            2>&1 | tee "$LOG_DIR/export_xlsx.log"
+
+          cat >> "$RUN_ROOT/run.env" <<EOF
+export RUN_ID="$RUN_ID"
+export FULL_REPORT="$FULL_REPORT"
+export XLSX_PATH="$XLSX_PATH"
+EOF
+
+          echo "RUN_ID=$RUN_ID"
+          echo "FULL_REPORT=$FULL_REPORT"
+          echo "XLSX_PATH=$XLSX_PATH"
         '''
       }
     }
@@ -199,15 +299,20 @@ PY
 import json
 from pathlib import Path
 
-p = Path("$FINAL_ANALYSIS_JSON")
-if not p.exists():
-    raise SystemExit(f"Final analysis output missing: {p}")
+p = Path("$FULL_REPORT")
+if not p.exists() or p.stat().st_size == 0:
+    raise SystemExit(f"Full report missing or empty: {p}")
+
 obj = json.loads(p.read_text(encoding="utf-8"))
-analysis_id = obj.get("analysis_id")
-results = obj.get("results") or []
+analysis = obj.get("analysis_result") or {}
+analysis_id = obj.get("analysis_id") or analysis.get("analysis_id")
+results = analysis.get("results") or []
+
 print("Final analysis summary")
+print(f"run_id: {'$RUN_ID'}")
 print(f"analysis_id: {analysis_id}")
 print(f"results: {len(results)}")
+print(f"xlsx: {'$XLSX_PATH'}")
 PY
         '''
       }
@@ -219,10 +324,10 @@ PY
       archiveArtifacts artifacts: '.jenkins_work/**', fingerprint: true, onlyIfSuccessful: false
     }
     failure {
-      echo 'Pipeline failed. Inspect archived logs under .jenkins_work/logs/.'
+      echo 'Pipeline failed. Inspect archived logs under .jenkins_work/logs/ and run artifacts under .jenkins_work/run-*/.'
     }
     success {
-      echo 'Pipeline completed successfully. Final output is archived under .jenkins_work/**.'
+      echo 'Pipeline completed successfully. Index, run reports, and XLSX are archived under .jenkins_work/**.'
     }
   }
 }

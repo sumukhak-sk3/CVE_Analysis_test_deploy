@@ -80,11 +80,16 @@ dtrack:
 jenkins:
   # Base URL of Jenkins controller and job name (supports folders: a/b/c).
   base_url: ${JENKINS_BASE_URL:-https://jenkins.inca.infoblox.com}
-  job_name: ${JENKINS_JOB_NAME:-NIOS-CVE-Analyser/sbom-to-cyclonedx-dtrack}
+  job_name: ${JENKINS_JOB_NAME:-NIOS-CVE-Analyser/nios-test}
+  # TLS behavior for backend -> Jenkins API calls.
+  # Keep true in production. For local/self-signed cert setups, set false.
+  verify_ssl: ${JENKINS_VERIFY_SSL:-false}
+  # Optional PEM bundle path for internal CA certs.
+  ca_bundle: ${JENKINS_CA_BUNDLE:-}
   # Optional auth for Jenkins API trigger.
   user: ${JENKINS_USER:-nkedilaya}
-  api_token: ${JENKINS_API_TOKEN:-}
-  trigger_token: ${JENKINS_TRIGGER_TOKEN:-}
+  api_token: ${JENKINS_API_TOKEN:-1130cdd1a1b8b6189e2718c1d5058ebdbe}
+  # trigger_token: ${JENKINS_TRIGGER_TOKEN:-}
   # Public API base Jenkins can reach to download uploaded SBOMs.
   # Example: http://10.120.23.89:8088
   public_api_base: ${PUBLIC_API_BASE_URL:-http://10.120.23.89:8088}

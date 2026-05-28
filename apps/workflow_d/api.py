@@ -39,12 +39,14 @@ Design / security
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
 import subprocess
 import threading
 import time
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1797,22 +1799,53 @@ def create_app(config_path: str | None = None) -> FastAPI:
             "Accept": "application/json,text/plain,*/*",
         }
         headers.update(_auth_header())
+        crumb_fetch_error: str | None = None
+
+        verify_ssl_raw = payload.get("jenkins_verify_ssl")
+        if verify_ssl_raw is None:
+            verify_ssl_raw = jcfg.get("verify_ssl", True)
+        verify_ssl = str(verify_ssl_raw).strip().lower() not in {
+            "0", "false", "no", "off", ""
+        }
+        ca_bundle = (
+            str(payload.get("jenkins_ca_bundle") or jcfg.get("ca_bundle") or "")
+            .strip()
+        )
+
+        if verify_ssl:
+            try:
+                ssl_context = (
+                    ssl.create_default_context(cafile=ca_bundle)
+                    if ca_bundle
+                    else ssl.create_default_context()
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid Jenkins CA bundle: {exc}",
+                ) from exc
+        else:
+            ssl_context = ssl._create_unverified_context()
 
         # Best-effort crumb support for Jenkins setups that require CSRF crumbs.
+        # We keep running on crumb fetch failures (for controllers with crumbs
+        # disabled), but preserve the failure reason for clearer diagnostics.
         try:
             crumb_req = urllib.request.Request(
                 f"{jbase.rstrip('/')}/crumbIssuer/api/json",
                 headers=headers,
                 method="GET",
             )
-            with urllib.request.urlopen(crumb_req, timeout=15) as resp:
+            with urllib.request.urlopen(crumb_req, timeout=15, context=ssl_context) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
                 crumb_field = body.get("crumbRequestField")
                 crumb = body.get("crumb")
                 if crumb_field and crumb:
                     headers[str(crumb_field)] = str(crumb)
-        except Exception:  # noqa: BLE001
-            pass
+                else:
+                    crumb_fetch_error = "crumb endpoint returned no crumb fields"
+        except Exception as exc:  # noqa: BLE001
+            crumb_fetch_error = str(exc)
 
         build_url = f"{_jenkins_job_url(jbase, jjob)}/buildWithParameters"
         encoded = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode("utf-8")
@@ -1830,7 +1863,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
         try:
             req = urllib.request.Request(build_url, data=encoded, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=ssl_context) as resp:
                 queue_url = resp.headers.get("Location")
                 record["state"] = "queued"
                 record["http_status"] = getattr(resp, "status", 201)
@@ -1841,15 +1874,27 @@ def create_app(config_path: str | None = None) -> FastAPI:
             record["state"] = "failed"
             record["http_status"] = exc.code
             record["error"] = detail or str(exc)
+            if crumb_fetch_error:
+                record["crumb_fetch_error"] = crumb_fetch_error
             _jenkins_dir(cfg).mkdir(parents=True, exist_ok=True)
             _jenkins_ticket_path(cfg, record["ticket"]).write_text(
                 json.dumps(record, indent=2), encoding="utf-8"
             )
             log_event(logger, "jenkins.trigger_failed", ticket=record["ticket"], error=record.get("error"))
+            if exc.code == 403 and crumb_fetch_error:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "jenkins trigger failed: HTTP 403 "
+                        f"(crumb fetch failed: {crumb_fetch_error})"
+                    ),
+                ) from exc
             raise HTTPException(status_code=502, detail=f"jenkins trigger failed: HTTP {exc.code}") from exc
         except Exception as exc:  # noqa: BLE001
             record["state"] = "failed"
             record["error"] = str(exc)
+            if crumb_fetch_error:
+                record["crumb_fetch_error"] = crumb_fetch_error
             _jenkins_dir(cfg).mkdir(parents=True, exist_ok=True)
             _jenkins_ticket_path(cfg, record["ticket"]).write_text(
                 json.dumps(record, indent=2), encoding="utf-8"

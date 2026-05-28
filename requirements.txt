@@ -8,3 +8,4 @@ tenacity>=8.2
 python-json-logger>=2.0
 python-dotenv>=1.0
 python-multipart>=0.0.9
+openpyxl>=3.1
