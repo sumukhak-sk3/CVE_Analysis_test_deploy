@@ -110,7 +110,8 @@ EOF
 
           if [[ -n "${VULNERABILITIES_FILE_URL:-}" ]]; then
             echo "Downloading vulnerabilities file from URL"
-            SRC_NAME="$(basename "${VULNERABILITIES_FILE_URL%%\?*}")"
+            CLEAN_URL="$(printf '%s' "$VULNERABILITIES_FILE_URL" | cut -d'?' -f1)"
+            SRC_NAME="$(basename "$CLEAN_URL")"
             [[ -n "$SRC_NAME" ]] || SRC_NAME="vulnerabilities.json"
             EXT_LOWER="$(echo "${SRC_NAME##*.}" | tr '[:upper:]' '[:lower:]')"
             VULNS_LOCAL_PATH="$INPUT_DIR/vulnerabilities.${EXT_LOWER}"
