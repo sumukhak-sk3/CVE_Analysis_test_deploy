@@ -1,6 +1,6 @@
 pipeline {
   agent {
-    label 'ubuntu_bin2'
+    label 'bondi-u20'
   }
 
   options {
