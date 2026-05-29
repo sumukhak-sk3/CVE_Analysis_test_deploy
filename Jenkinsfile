@@ -324,12 +324,10 @@ PY
   post {
     always {
       script {
-        node('ubuntu_bin2') {
-          if (fileExists('.jenkins_work')) {
-            archiveArtifacts artifacts: '.jenkins_work/**', fingerprint: true, onlyIfSuccessful: false
-          } else {
-            echo 'No .jenkins_work directory found; skipping artifact archive.'
-          }
+        if (fileExists('.jenkins_work')) {
+          archiveArtifacts artifacts: '.jenkins_work/**', fingerprint: true, onlyIfSuccessful: false
+        } else {
+          echo 'No .jenkins_work directory found; skipping artifact archive.'
         }
       }
     }
