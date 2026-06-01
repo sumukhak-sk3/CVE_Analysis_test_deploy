@@ -324,6 +324,14 @@ PY
   post {
     always {
       script {
+        sh '''#!/usr/bin/env bash
+          # Clean old run directories to free disk space, keep last 3
+          echo "Cleaning old run directories to free disk space..."
+          cd "$RUN_ROOT" 2>/dev/null || true
+          ls -td run-* 2>/dev/null | tail -n +4 | xargs -r rm -rf
+          echo "Cleanup complete."
+        '''
+        
         if (fileExists('.jenkins_work')) {
           archiveArtifacts artifacts: '.jenkins_work/**', fingerprint: true, onlyIfSuccessful: false
         } else {
