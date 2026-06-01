@@ -65,9 +65,19 @@ pipeline {
               fi
 
               if [[ -d "$CANDIDATE" ]]; then
-                PICKED="$(find "$CANDIDATE" -maxdepth 1 -type f \
-                  \( -iname '*.json' -o -iname '*.csv' -o -iname '*.xlsx' -o -iname '*.xlsm' \) \
-                  -print0 | xargs -0 ls -1t 2>/dev/null | head -n 1 || true)"
+                PICKED="$(
+                  find "$CANDIDATE" -maxdepth 1 -type f -print0 \
+                    | xargs -0 ls -1t 2>/dev/null \
+                    | while IFS= read -r f; do
+                        low="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
+                        case "$low" in
+                          *.json|*.csv|*.xlsx|*.xlsm)
+                            printf '%s\n' "$f"
+                            break
+                            ;;
+                        esac
+                      done
+                )"
                 if [[ -z "$PICKED" ]]; then
                   echo "ERROR: No supported input file in directory: $CANDIDATE" >&2
                   exit 1
