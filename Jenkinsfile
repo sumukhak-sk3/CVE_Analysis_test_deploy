@@ -32,6 +32,19 @@ pipeline {
   }
 
   stages {
+    stage('Cleanup Old Builds') {
+      steps {
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          echo "Cleaning up old builds from workspace..."
+          rm -rf "${WORKSPACE}/.jenkins_work/run-"* || true
+          rm -rf "${WORKSPACE}/@tmp" || true
+          df -h "$WORKSPACE" || true
+          echo "Cleanup complete."
+        '''
+      }
+    }
+
     stage('Validate Parameters') {
       steps {
         sh '''#!/usr/bin/env bash
