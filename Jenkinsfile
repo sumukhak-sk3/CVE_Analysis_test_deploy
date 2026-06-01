@@ -23,7 +23,6 @@ pipeline {
   }
 
   environment {
-    PYTHON_BIN = 'python3'
     RUN_ID = ''
     VULNS_PATH = ''
   }
@@ -32,77 +31,60 @@ pipeline {
     stage('Resolve Input File') {
       steps {
         script {
-          env.VULNS_PATH = sh(
-            returnStdout: true,
-            script: '''#!/usr/bin/env bash
-              set -euo pipefail
+          int limit = params.LIMIT?.trim()?.isInteger() ? params.LIMIT.toInteger() : -1
+          int workers = params.WORKERS?.trim()?.isInteger() ? params.WORKERS.toInteger() : -1
+          int pollInterval = params.POLL_INTERVAL_SECONDS?.trim()?.isInteger() ? params.POLL_INTERVAL_SECONDS.toInteger() : -1
+          int pollTimeout = params.POLL_TIMEOUT_SECONDS?.trim()?.isInteger() ? params.POLL_TIMEOUT_SECONDS.toInteger() : -1
 
-              if [[ ! "${LIMIT:-}" =~ ^[0-9]+$ ]]; then
-                echo "ERROR: LIMIT must be a non-negative integer" >&2
-                exit 1
-              fi
-              if [[ ! "${WORKERS:-}" =~ ^[0-9]+$ || "${WORKERS:-}" -le 0 ]]; then
-                echo "ERROR: WORKERS must be a positive integer" >&2
-                exit 1
-              fi
-              if [[ ! "${POLL_INTERVAL_SECONDS:-}" =~ ^[0-9]+$ || "${POLL_INTERVAL_SECONDS:-}" -le 0 ]]; then
-                echo "ERROR: POLL_INTERVAL_SECONDS must be a positive integer" >&2
-                exit 1
-              fi
-              if [[ ! "${POLL_TIMEOUT_SECONDS:-}" =~ ^[0-9]+$ || "${POLL_TIMEOUT_SECONDS:-}" -le 0 ]]; then
-                echo "ERROR: POLL_TIMEOUT_SECONDS must be a positive integer" >&2
-                exit 1
-              fi
+          if (limit < 0) {
+            error('LIMIT must be a non-negative integer')
+          }
+          if (workers <= 0) {
+            error('WORKERS must be a positive integer')
+          }
+          if (pollInterval <= 0) {
+            error('POLL_INTERVAL_SECONDS must be a positive integer')
+          }
+          if (pollTimeout <= 0) {
+            error('POLL_TIMEOUT_SECONDS must be a positive integer')
+          }
 
-              CANDIDATE="$INPUT_PATH"
-              if [[ "$CANDIDATE" != /* ]]; then
-                CANDIDATE="$WORKSPACE/$CANDIDATE"
-              fi
+          def supported = ['json', 'csv', 'xlsx', 'xlsm']
+          File candidate = new File(params.INPUT_PATH)
+          if (!candidate.isAbsolute()) {
+            candidate = new File(env.WORKSPACE, params.INPUT_PATH)
+          }
 
-              if [[ ! -e "$CANDIDATE" ]]; then
-                echo "ERROR: INPUT_PATH not found: $CANDIDATE" >&2
-                exit 1
-              fi
+          if (!candidate.exists()) {
+            error("INPUT_PATH not found: ${candidate.absolutePath}")
+          }
 
-              if [[ -d "$CANDIDATE" ]]; then
-                PICKED="$(
-                  find "$CANDIDATE" -maxdepth 1 -type f -print0 \
-                    | xargs -0 ls -1t 2>/dev/null \
-                    | while IFS= read -r f; do
-                        low="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
-                        case "$low" in
-                          *.json|*.csv|*.xlsx|*.xlsm)
-                            printf '%s\n' "$f"
-                            break
-                            ;;
-                        esac
-                      done
-                )"
-                if [[ -z "$PICKED" ]]; then
-                  echo "ERROR: No supported input file in directory: $CANDIDATE" >&2
-                  exit 1
-                fi
-                CANDIDATE="$PICKED"
-              fi
+          if (candidate.isDirectory()) {
+            List<File> files = candidate
+              .listFiles()
+              ?.findAll { it.isFile() }
+              ?.findAll {
+                String n = it.name.toLowerCase(java.util.Locale.ROOT)
+                supported.any { ext -> n.endsWith('.' + ext) }
+              }
+              ?.sort { a, b -> b.lastModified() <=> a.lastModified() } ?: []
 
-              EXT_LOWER="$(echo "${CANDIDATE##*.}" | tr '[:upper:]' '[:lower:]')"
-              case "$EXT_LOWER" in
-                json|csv|xlsx|xlsm) ;;
-                *)
-                  echo "ERROR: INPUT_PATH file extension must be .json/.csv/.xlsx/.xlsm" >&2
-                  exit 1
-                  ;;
-              esac
+            if (files.isEmpty()) {
+              error("No supported input file in directory: ${candidate.absolutePath}")
+            }
+            candidate = files[0]
+          }
 
-              if [[ ! -s "$CANDIDATE" ]]; then
-                echo "ERROR: Input file is empty: $CANDIDATE" >&2
-                exit 1
-              fi
+          String name = candidate.name.toLowerCase(java.util.Locale.ROOT)
+          boolean extOk = supported.any { ext -> name.endsWith('.' + ext) }
+          if (!extOk) {
+            error('INPUT_PATH file extension must be .json/.csv/.xlsx/.xlsm')
+          }
+          if (candidate.length() <= 0) {
+            error("Input file is empty: ${candidate.absolutePath}")
+          }
 
-              printf '%s' "$CANDIDATE"
-            '''
-          ).trim()
-
+          env.VULNS_PATH = candidate.absolutePath
           echo "Resolved input file: ${env.VULNS_PATH}"
         }
       }
@@ -111,46 +93,52 @@ pipeline {
     stage('Start Workflow D Run') {
       steps {
         script {
-          env.RUN_ID = sh(
-            returnStdout: true,
-            script: '''#!/usr/bin/env bash
-              set -euo pipefail
+          List<String> severities = (params.SEVERITIES ?: 'CRITICAL,HIGH')
+            .split(',')
+            .collect { it.trim().toUpperCase(java.util.Locale.ROOT) }
+            .findAll { it }
+          if (severities.isEmpty()) {
+            severities = ['CRITICAL', 'HIGH']
+          }
 
-              PAYLOAD="$($PYTHON_BIN - <<'PY'
-import json
-import os
+          def payload = [
+            vulns_path: env.VULNS_PATH,
+            severities: severities,
+            limit: params.LIMIT.toInteger(),
+            mode: params.ANALYSIS_MODE,
+            workers: params.WORKERS.toInteger(),
+          ]
 
-sevs = [x.strip().upper() for x in os.environ.get("SEVERITIES", "CRITICAL,HIGH").split(",") if x.strip()]
-payload = {
-    "vulns_path": os.environ["VULNS_PATH"],
-    "severities": sevs or ["CRITICAL", "HIGH"],
-    "limit": int(os.environ.get("LIMIT", "0") or "0"),
-    "mode": os.environ.get("ANALYSIS_MODE", "standard"),
-    "workers": int(os.environ.get("WORKERS", "4") or "4"),
-}
-print(json.dumps(payload))
-PY
-              )"
+          String base = (params.WORKFLOW_D_API_BASE ?: '').trim().replaceAll('/+$', '')
+          if (!base) {
+            error('WORKFLOW_D_API_BASE is required')
+          }
 
-              RESP="$(curl --fail --silent --show-error \
-                -H 'Content-Type: application/json' \
-                -X POST \
-                --data "$PAYLOAD" \
-                "$WORKFLOW_D_API_BASE/runs/start")"
+          URL url = new URL(base + '/runs/start')
+          HttpURLConnection conn = (HttpURLConnection) url.openConnection()
+          conn.setRequestMethod('POST')
+          conn.setConnectTimeout(30000)
+          conn.setReadTimeout(120000)
+          conn.setRequestProperty('Content-Type', 'application/json')
+          conn.setDoOutput(true)
+          conn.outputStream.withWriter('UTF-8') { w ->
+            w << groovy.json.JsonOutput.toJson(payload)
+          }
 
-              export RESP
-              "$PYTHON_BIN" - <<'PY'
-import json
-import os
+          int code = conn.responseCode
+          String body
+          if (code >= 200 && code < 300) {
+            body = conn.inputStream.getText('UTF-8')
+          } else {
+            body = conn.errorStream ? conn.errorStream.getText('UTF-8') : ''
+            error("Failed to start run: HTTP ${code} ${body}")
+          }
 
-obj = json.loads(os.environ["RESP"])
-rid = obj.get("run_id")
-if not rid:
-    raise SystemExit("run_id missing in /runs/start response")
-print(rid)
-PY
-            '''
-          ).trim()
+          def obj = new groovy.json.JsonSlurperClassic().parseText(body)
+          if (!(obj instanceof Map) || !obj.run_id) {
+            error("run_id missing in /runs/start response: ${body}")
+          }
+          env.RUN_ID = String.valueOf(obj.run_id)
 
           echo "Started run_id: ${env.RUN_ID}"
           echo "Frontend/API run URL: ${params.WORKFLOW_D_API_BASE}/runs/${env.RUN_ID}"
@@ -160,62 +148,56 @@ PY
 
     stage('Wait For Completion') {
       steps {
-        sh '''#!/usr/bin/env bash
-          set -euo pipefail
+        script {
+          String base = (params.WORKFLOW_D_API_BASE ?: '').trim().replaceAll('/+$', '')
+          int intervalSec = params.POLL_INTERVAL_SECONDS.toInteger()
+          int timeoutSec = params.POLL_TIMEOUT_SECONDS.toInteger()
+          long deadline = System.currentTimeMillis() + (timeoutSec * 1000L)
 
-          start_ts="$(date +%s)"
-          timeout_sec="$POLL_TIMEOUT_SECONDS"
-          interval_sec="$POLL_INTERVAL_SECONDS"
+          while (true) {
+            URL url = new URL(base + '/runs/' + env.RUN_ID)
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection()
+            conn.setRequestMethod('GET')
+            conn.setConnectTimeout(30000)
+            conn.setReadTimeout(120000)
 
-          while true; do
-            RESP="$(curl --silent --show-error "$WORKFLOW_D_API_BASE/runs/$RUN_ID")"
+            int code = conn.responseCode
+            String body = (code >= 200 && code < 300) ?
+              conn.inputStream.getText('UTF-8') :
+              (conn.errorStream ? conn.errorStream.getText('UTF-8') : '')
 
-            export RESP
-            STATE="$($PYTHON_BIN - <<'PY'
-import json
-import os
+            if (code < 200 || code >= 300) {
+              error("Failed polling run status: HTTP ${code} ${body}")
+            }
 
-obj = json.loads(os.environ["RESP"])
-status = obj.get("status") or {}
-state = status.get("state")
-if not state and obj.get("artifact"):
-    state = "completed"
-print(state or "")
-PY
-            )"
+            def obj = new groovy.json.JsonSlurperClassic().parseText(body)
+            def statusObj = (obj instanceof Map && obj.status instanceof Map) ? obj.status : [:]
+            String state = statusObj.state ? String.valueOf(statusObj.state) : ''
+            String analysisId = statusObj.analysis_id ? String.valueOf(statusObj.analysis_id) : 'n/a'
 
-            ANALYSIS_ID="$($PYTHON_BIN - <<'PY'
-import json
-import os
+            if (!state && obj instanceof Map && obj.artifact) {
+              state = 'completed'
+            }
 
-obj = json.loads(os.environ["RESP"])
-status = obj.get("status") or {}
-print(status.get("analysis_id") or "")
-PY
-            )"
+            echo "run_id=${env.RUN_ID} state=${state ?: 'unknown'} analysis_id=${analysisId}"
 
-            echo "run_id=$RUN_ID state=${STATE:-unknown} analysis_id=${ANALYSIS_ID:-n/a}"
-
-            if [[ "$STATE" == "ok" || "$STATE" == "completed" ]]; then
-              echo "Run completed successfully."
-              echo "View in frontend/API: $WORKFLOW_D_API_BASE/runs/$RUN_ID"
+            if (state == 'ok' || state == 'completed') {
+              echo 'Run completed successfully.'
+              echo "View in frontend/API: ${base}/runs/${env.RUN_ID}"
               break
-            fi
-            if [[ "$STATE" == "failed" || "$STATE" == "cancelled" || "$STATE" == "rejected" ]]; then
-              echo "Run finished with state=$STATE" >&2
-              exit 1
-            fi
+            }
 
-            now_ts="$(date +%s)"
-            elapsed="$((now_ts - start_ts))"
-            if (( elapsed >= timeout_sec )); then
-              echo "Timed out waiting for run completion after ${elapsed}s" >&2
-              exit 1
-            fi
+            if (state == 'failed' || state == 'cancelled' || state == 'rejected') {
+              error("Run finished with state=${state}")
+            }
 
-            sleep "$interval_sec"
-          done
-        '''
+            if (System.currentTimeMillis() >= deadline) {
+              error("Timed out waiting for run completion after ${timeoutSec}s")
+            }
+
+            sleep(time: intervalSec, unit: 'SECONDS')
+          }
+        }
       }
     }
   }
