@@ -111,7 +111,9 @@ pipeline {
           API_BASE="${API_BASE_URL_CLEAN%/}"
           PROJECT_NAME="$(basename "$REPOSITORY_URL_CLEAN")"
           PROJECT_NAME="${PROJECT_NAME%.git}"
-          PROJECT_NAME="$(echo "$PROJECT_NAME" | tr -cs 'A-Za-z0-9._-' '-')"
+          PROJECT_NAME="$(printf '%s' "$PROJECT_NAME" | tr -cs 'A-Za-z0-9._-' '-')"
+          PROJECT_NAME="${PROJECT_NAME#-}"
+          PROJECT_NAME="${PROJECT_NAME%-}"
 
           if [[ -n "${OUTPUT_DIR:-}" ]]; then
             if [[ "${OUTPUT_DIR}" = /* ]]; then
@@ -172,40 +174,70 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-          # If caller provided an existing index id, verify it exists and skip rebuilding.
-          if [[ -n "${EXISTING_INDEX_ID_CLEAN:-}" ]]; then
-            curl --fail --silent --show-error "$API_BASE/indexes" -o "$RUN_DIR/indexes.json"
+          curl --fail --silent --show-error "$API_BASE/indexes" -o "$RUN_DIR/indexes.json"
 
-            IDX_AND_ROOT="$($PYTHON_BIN - <<PY
+          # Reuse an existing VM index when possible: explicit id takes priority,
+          # otherwise auto-pick the newest index for project+branch.
+          IDX_SELECT="$($PYTHON_BIN - <<PY
 import json
 from pathlib import Path
 
 target = "${EXISTING_INDEX_ID_CLEAN}".strip()
+project = "${PROJECT_NAME}".strip()
+branch = "${BRANCH_CLEAN}".strip()
 data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
 indexes = data.get("indexes") or []
-picked = next((i for i in indexes if (i.get("id") or "") == target), None)
-if not picked:
-    raise SystemExit(f"Requested EXISTING_INDEX_ID not found on backend VM: {target}")
-print((picked.get("id") or "") + "\t" + (picked.get("repo_root") or ""))
+
+picked = None
+reason = ""
+if target:
+    picked = next((i for i in indexes if (i.get("id") or "") == target), None)
+    if picked is None:
+        raise SystemExit(f"Requested EXISTING_INDEX_ID not found on backend VM: {target}")
+    reason = "provided"
+else:
+    matches = [i for i in indexes if (i.get("project") == project and i.get("branch") == branch)]
+    if matches:
+        matches.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
+        picked = matches[0]
+        reason = "auto"
+
+if picked:
+    print("true")
+    print(picked.get("id") or "")
+    print(picked.get("repo_root") or "")
+    print(reason)
+else:
+    print("false")
+    print("")
+    print("")
+    print("none")
 PY
 )"
 
-            INDEX_ID="${IDX_AND_ROOT%%$'\t'*}"
-            REPO_ROOT="${IDX_AND_ROOT#*$'\t'}"
+          REUSE_EXISTING="$(printf '%s\n' "$IDX_SELECT" | sed -n '1p')"
+          INDEX_ID="$(printf '%s\n' "$IDX_SELECT" | sed -n '2p')"
+          REPO_ROOT="$(printf '%s\n' "$IDX_SELECT" | sed -n '3p')"
+          REUSE_REASON="$(printf '%s\n' "$IDX_SELECT" | sed -n '4p')"
 
+          if [[ "$REUSE_EXISTING" == "true" ]]; then
             if [[ -z "$INDEX_ID" ]]; then
-              echo "ERROR: EXISTING_INDEX_ID lookup returned empty index id" >&2
+              echo "ERROR: existing index selection returned empty index id" >&2
               exit 1
             fi
-
             cat >> "$RUN_ROOT/run.env" <<EOF
 export INDEX_ID="$INDEX_ID"
 export REPO_ROOT="$REPO_ROOT"
 EOF
 
-            echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
+            if [[ "$REUSE_REASON" == "provided" ]]; then
+              echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
+              echo "Skipping /index/build because EXISTING_INDEX_ID was provided."
+            else
+              echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
+              echo "Skipping /index/build because project+branch index already exists."
+            fi
             echo "REPO_ROOT=$REPO_ROOT"
-            echo "Skipping /index/build because EXISTING_INDEX_ID was provided."
             exit 0
           fi
 
@@ -268,8 +300,6 @@ PY
             echo "ERROR: Timed out waiting for /index/status to reach ok" >&2
             exit 1
           fi
-
-          curl --fail --silent --show-error "$API_BASE/indexes" -o "$RUN_DIR/indexes.json"
 
           IDX_AND_ROOT="$($PYTHON_BIN - <<PY
 import json
