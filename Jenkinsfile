@@ -176,42 +176,103 @@ EOF
 
           curl --fail --silent --show-error "$API_BASE/indexes" -o "$RUN_DIR/indexes.json"
 
-          # Reuse an existing VM index when possible: explicit id takes priority,
-          # otherwise auto-pick the newest index for project+branch.
+            # Reuse an existing VM index when possible: explicit id takes priority.
+            # If explicit id is not found, fall back to project+branch matching.
           IDX_SELECT="$($PYTHON_BIN - <<PY
 import json
+import re
+import sys
 from pathlib import Path
 
 target = "${EXISTING_INDEX_ID_CLEAN}".strip()
 project = "${PROJECT_NAME}".strip()
 branch = "${BRANCH_CLEAN}".strip()
+repo_url = "${REPOSITORY_URL_CLEAN}".strip()
 data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
 indexes = data.get("indexes") or []
 
 picked = None
 reason = ""
+
+def norm(s: str) -> str:
+  return re.sub(r"[^A-Za-z0-9._-]+", "-", (s or "")).strip("-").lower()
+
+def idx_id(item: dict) -> str:
+  return (item.get("id") or item.get("index_id") or "").strip()
+
+def norm_git(u: str) -> str:
+  s = (u or "").strip().lower()
+  if s.endswith(".git"):
+    s = s[:-4]
+  return s
+
+target_norm = norm(target)
+project_norm = norm(project)
+branch_norm = norm(branch)
+
 if target:
-    picked = next((i for i in indexes if (i.get("id") or "") == target), None)
-    if picked is None:
-        raise SystemExit(f"Requested EXISTING_INDEX_ID not found on backend VM: {target}")
+  picked = next((i for i in indexes if idx_id(i) == target), None)
+  if picked is None and target_norm:
+    picked = next((i for i in indexes if norm(idx_id(i)) == target_norm), None)
+  if picked is None:
+    print(f"WARNING: Requested EXISTING_INDEX_ID not found on backend VM: {target}", file=sys.stderr)
+    print("Known indexes from /indexes:", file=sys.stderr)
+    for i in indexes:
+      print(f"  - {idx_id(i)}", file=sys.stderr)
+    reason = "provided_missing"
+  else:
     reason = "provided"
-else:
-    matches = [i for i in indexes if (i.get("project") == project and i.get("branch") == branch)]
-    if matches:
-        matches.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
-        picked = matches[0]
-        reason = "auto"
+
+if picked is None:
+  # Primary auto-match: exact project+branch metadata.
+  repo_norm = norm_git(repo_url)
+  def repo_match(i: dict) -> bool:
+    g = norm_git(i.get("git_url") or "")
+    return (not repo_norm) or (g == repo_norm)
+
+  matches = [
+    i for i in indexes
+    if (
+      ((i.get("project") or project) == project) and
+      ((i.get("branch") or "") == branch) and
+      repo_match(i)
+    )
+  ]
+  if not matches:
+    # Fallback: normalized metadata match for branch naming differences.
+    matches = [
+      i for i in indexes
+      if (
+        (norm(i.get("project") or project) == project_norm) and
+        (norm(i.get("branch") or "") == branch_norm) and
+        repo_match(i)
+      )
+    ]
+  if not matches and project_norm and branch_norm:
+    # Final fallback: infer from index id pattern when branch metadata is absent/inconsistent.
+    matches = [
+      i for i in indexes
+      if (
+        norm(idx_id(i)).startswith(f"{project_norm}__") and
+        branch_norm in norm(idx_id(i)) and
+        repo_match(i)
+      )
+    ]
+  if matches:
+    matches.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
+    picked = matches[0]
+    reason = "auto"
 
 if picked:
-    print("true")
-    print(picked.get("id") or "")
-    print(picked.get("repo_root") or "")
-    print(reason)
+  print("true")
+  print(idx_id(picked))
+  print(picked.get("repo_root") or "")
+  print(reason)
 else:
-    print("false")
-    print("")
-    print("")
-    print("none")
+  print("false")
+  print("")
+  print("")
+  print("none")
 PY
 )"
 
@@ -220,7 +281,7 @@ PY
           REPO_ROOT="$(printf '%s\n' "$IDX_SELECT" | sed -n '3p')"
           REUSE_REASON="$(printf '%s\n' "$IDX_SELECT" | sed -n '4p')"
 
-          if [[ "$REUSE_EXISTING" == "true" ]]; then
+            if [[ "$REUSE_EXISTING" == "true" ]]; then
             if [[ -z "$INDEX_ID" ]]; then
               echo "ERROR: existing index selection returned empty index id" >&2
               exit 1
@@ -303,15 +364,55 @@ PY
 
           IDX_AND_ROOT="$($PYTHON_BIN - <<PY
 import json
+import re
 from pathlib import Path
+
+def norm(s: str) -> str:
+  return re.sub(r"[^A-Za-z0-9._-]+", "-", (s or "")).strip("-").lower()
+
+def idx_id(item: dict) -> str:
+  return (item.get("id") or item.get("index_id") or "").strip()
+
+def norm_git(u: str) -> str:
+  s = (u or "").strip().lower()
+  if s.endswith(".git"):
+    s = s[:-4]
+  return s
+
 data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
 indexes = data.get("indexes") or []
-matches = [i for i in indexes if (i.get("project") == "${PROJECT_NAME}" and i.get("branch") == "${BRANCH_CLEAN}")]
+project = "${PROJECT_NAME}"
+branch = "${BRANCH_CLEAN}"
+repo_norm = norm_git("${REPOSITORY_URL_CLEAN}")
+
+def repo_match(i: dict) -> bool:
+  g = norm_git(i.get("git_url") or "")
+  return (not repo_norm) or (g == repo_norm)
+
+matches = [
+  i for i in indexes
+  if (
+    ((i.get("project") or project) == project) and
+    ((i.get("branch") or "") == branch) and
+    repo_match(i)
+  )
+]
+if not matches:
+  project_norm = norm(project)
+  branch_norm = norm(branch)
+  matches = [
+    i for i in indexes
+    if (
+      (norm(i.get("project") or project) == project_norm) and
+      (norm(i.get("branch") or "") == branch_norm) and
+      repo_match(i)
+    )
+  ]
 if not matches:
     raise SystemExit("No index found for requested project/branch after build")
 matches.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
 picked = matches[0]
-print((picked.get("id") or "") + "\t" + (picked.get("repo_root") or ""))
+print(idx_id(picked) + "\t" + (picked.get("repo_root") or ""))
 PY
 )"
 
