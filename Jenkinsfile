@@ -36,36 +36,61 @@ pipeline {
           set -euo pipefail
           mkdir -p "$RUN_ROOT" "$LOG_DIR"
 
-          if [[ -z "${REPOSITORY_URL:-}" ]]; then
+          trim_spaces() {
+            local s="$1"
+            s="${s#"${s%%[![:space:]]*}"}"
+            s="${s%"${s##*[![:space:]]}"}"
+            printf '%s' "$s"
+          }
+
+          sanitize_param() {
+            local v
+            v="$(trim_spaces "$1")"
+            if [[ ${#v} -ge 2 ]]; then
+              if [[ "${v:0:1}" == '"' && "${v: -1}" == '"' ]]; then
+                v="${v:1:${#v}-2}"
+              elif [[ "${v:0:1}" == "'" && "${v: -1}" == "'" ]]; then
+                v="${v:1:${#v}-2}"
+              fi
+            fi
+            printf '%s' "$(trim_spaces "$v")"
+          }
+
+          REPOSITORY_URL_CLEAN="$(sanitize_param "${REPOSITORY_URL:-}")"
+          BRANCH_CLEAN="$(sanitize_param "${BRANCH:-}")"
+          VULNERABILITIES_FILE_PATH_CLEAN="$(sanitize_param "${VULNERABILITIES_FILE_PATH:-}")"
+          API_BASE_URL_CLEAN="$(sanitize_param "${API_BASE_URL:-}")"
+
+          if [[ -z "$REPOSITORY_URL_CLEAN" ]]; then
             echo "ERROR: REPOSITORY_URL is required" >&2
             exit 1
           fi
-          if [[ -z "${BRANCH:-}" ]]; then
+          if [[ -z "$BRANCH_CLEAN" ]]; then
             echo "ERROR: BRANCH is required" >&2
             exit 1
           fi
-          if [[ -z "${VULNERABILITIES_FILE_PATH:-}" ]]; then
+          if [[ -z "$VULNERABILITIES_FILE_PATH_CLEAN" ]]; then
             echo "ERROR: VULNERABILITIES_FILE_PATH is required" >&2
             exit 1
           fi
-          if [[ "${VULNERABILITIES_FILE_PATH}" != /* ]]; then
+          if [[ "$VULNERABILITIES_FILE_PATH_CLEAN" != /* ]]; then
             echo "ERROR: VULNERABILITIES_FILE_PATH must be an absolute path on the backend VM" >&2
             exit 1
           fi
-          EXT_LOWER="$(echo "${VULNERABILITIES_FILE_PATH##*.}" | tr '[:upper:]' '[:lower:]')"
+          EXT_LOWER="$(echo "${VULNERABILITIES_FILE_PATH_CLEAN##*.}" | tr '[:upper:]' '[:lower:]')"
           case "$EXT_LOWER" in
             json|csv|xlsx|xlsm) ;;
             *)
-              echo "ERROR: VULNERABILITIES_FILE_PATH extension must be .json/.csv/.xlsx/.xlsm" >&2
+              echo "ERROR: VULNERABILITIES_FILE_PATH extension must be .json/.csv/.xlsx/.xlsm (got: $VULNERABILITIES_FILE_PATH_CLEAN)" >&2
               exit 1
               ;;
           esac
 
-          if [[ -z "${API_BASE_URL:-}" ]]; then
+          if [[ -z "$API_BASE_URL_CLEAN" ]]; then
             echo "ERROR: API_BASE_URL is required" >&2
             exit 1
           fi
-          if [[ ! "${API_BASE_URL}" =~ ^https?:// ]]; then
+          if [[ ! "$API_BASE_URL_CLEAN" =~ ^https?:// ]]; then
             echo "ERROR: API_BASE_URL must start with http:// or https://" >&2
             exit 1
           fi
@@ -81,8 +106,8 @@ pipeline {
           fi
 
           RUN_DIR="$RUN_ROOT/run-${BUILD_NUMBER}"
-          API_BASE="${API_BASE_URL%/}"
-          PROJECT_NAME="$(basename "$REPOSITORY_URL")"
+          API_BASE="${API_BASE_URL_CLEAN%/}"
+          PROJECT_NAME="$(basename "$REPOSITORY_URL_CLEAN")"
           PROJECT_NAME="${PROJECT_NAME%.git}"
           PROJECT_NAME="$(echo "$PROJECT_NAME" | tr -cs 'A-Za-z0-9._-' '-')"
 
@@ -103,12 +128,16 @@ export RUN_DIR="$RUN_DIR"
 export OUTPUT_DIR_ABS="$OUTPUT_DIR_ABS"
 export API_BASE="$API_BASE"
 export PROJECT_NAME="$PROJECT_NAME"
+export REPOSITORY_URL_CLEAN="$REPOSITORY_URL_CLEAN"
+export BRANCH_CLEAN="$BRANCH_CLEAN"
+export VULNERABILITIES_FILE_PATH_CLEAN="$VULNERABILITIES_FILE_PATH_CLEAN"
 EOF
 
           echo "RUN_DIR=$RUN_DIR"
           echo "OUTPUT_DIR_ABS=$OUTPUT_DIR_ABS"
           echo "API_BASE=$API_BASE"
           echo "PROJECT_NAME=$PROJECT_NAME"
+          echo "VULNERABILITIES_FILE_PATH=$VULNERABILITIES_FILE_PATH_CLEAN"
         '''
       }
     }
@@ -143,11 +172,11 @@ EOF
           "$PYTHON_BIN" - <<PY
 import json
 payload = {
-    "git_url": "${REPOSITORY_URL}",
-    "branch": "${BRANCH}",
+        "git_url": "${REPOSITORY_URL_CLEAN}",
+        "branch": "${BRANCH_CLEAN}",
     "mode": "full",
     "project": "${PROJECT_NAME}",
-    "name": "${PROJECT_NAME} · ${BRANCH}",
+        "name": "${PROJECT_NAME} · ${BRANCH_CLEAN}",
 }
 with open("$INDEX_BUILD_PAYLOAD", "w", encoding="utf-8") as f:
     json.dump(payload, f)
@@ -206,7 +235,7 @@ import json
 from pathlib import Path
 data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
 indexes = data.get("indexes") or []
-matches = [i for i in indexes if (i.get("project") == "${PROJECT_NAME}" and i.get("branch") == "${BRANCH}")]
+matches = [i for i in indexes if (i.get("project") == "${PROJECT_NAME}" and i.get("branch") == "${BRANCH_CLEAN}")]
 if not matches:
     raise SystemExit("No index found for requested project/branch after build")
 matches.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
@@ -246,7 +275,7 @@ EOF
 import json
 severities = [s.strip() for s in "${SEVERITIES}".split(",") if s.strip()]
 payload = {
-    "vulns_path": "${VULNERABILITIES_FILE_PATH}",
+  "vulns_path": "${VULNERABILITIES_FILE_PATH_CLEAN}",
     "severities": severities or ["CRITICAL", "HIGH"],
     "limit": int("${LIMIT}"),
     "mode": "${ANALYSIS_MODE}",
