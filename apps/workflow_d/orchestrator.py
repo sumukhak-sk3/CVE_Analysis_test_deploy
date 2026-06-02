@@ -45,6 +45,7 @@ from ..enrichment.ubuntu_security import UbuntuSecurityClient
 from ..registry.sqlite_store import SqliteRegistry, metadata_hash
 from .confidence import ConfidencePolicy, compute_confidence
 from .evidence_builder import EvidenceBuilder
+from .patch_utils import build_patched_snippets, git_apply_check
 from .routing import RoutingPolicy, decide
 from .schemas import (
     AnalyzeRequest,
@@ -461,6 +462,7 @@ class Orchestrator:
         # 4. Fix authoring (only for code_change)
         fix: FixProposal | None = None
         verifier: VerifierResult | None = None
+        det: dict | None = None
         if triage.verdict == Verdict.code_change:
             fix = run_fix_author(self.model_client, bundle, self.prompts_dir)
             write_json(cve_dir / "fix_proposal.json", fix.model_dump(mode="json"))
@@ -471,20 +473,53 @@ class Orchestrator:
                               "verdict_override": fix.verdict_override.value if fix.verdict_override else None})
 
             if not fix.verdict_override and fix.patch_unified_diff:
+                # Deterministic pre-checks fed into the verifier packet so it
+                # has more than just a diff to reason about.
+                repo_root_for_check = (
+                    (event.build_context.repo_root if event.build_context else None)
+                    or self.evidence_builder.default_repo_root
+                )
+                det = {
+                    "git_apply_check": git_apply_check(
+                        fix.patch_unified_diff, repo_root_for_check
+                    ) if repo_root_for_check else {"ok": False, "ran": False, "reason": "no repo_root"},
+                    "patch_stats": {
+                        "files_touched": fix.files_touched,
+                        "lines_added": fix.lines_added,
+                        "lines_removed": fix.lines_removed,
+                    },
+                }
+                patched_snips = build_patched_snippets(
+                    fix.patch_unified_diff,
+                    repo_root_for_check,
+                    bundle.code_evidence,
+                )
+                det["patched_snippets_available"] = bool(patched_snips)
                 verifier = run_verifier(
-                    self.model_client, bundle, fix, self.prompts_dir
+                    self.model_client,
+                    bundle,
+                    fix,
+                    self.prompts_dir,
+                    deterministic_results=det,
+                    patched_code_snippets=patched_snips,
                 )
                 write_json(cve_dir / "verifier_result.json", verifier.model_dump(mode="json"))
                 stage_log.append({"stage": "verifier", "cve_id": event.cve_id,
                                   "verifier_verdict": verifier.verdict.value,
-                                  "verifier_confidence": verifier.verifier_confidence})
+                                  "verifier_confidence": verifier.verifier_confidence,
+                                  "git_apply_ok": det["git_apply_check"].get("ok"),
+                                  "patched_snippets": len(patched_snips)})
 
         # 5. Confidence
-        scores = compute_confidence(bundle, triage, fix, verifier, self.confidence_policy)
+        scores = compute_confidence(
+            bundle, triage, fix, verifier, self.confidence_policy,
+            deterministic_results=det,
+        )
 
         # 6. Routing
         routing = decide(bundle, triage, fix, verifier, scores,
-                         self.routing_policy, self.confidence_policy)
+                         self.routing_policy, self.confidence_policy,
+                         deterministic_results=det)
         write_json(cve_dir / "routing_decision.json", routing.model_dump(mode="json"))
         stage_log.append({"stage": "routing", "cve_id": event.cve_id,
                           "decision": routing.decision.value,

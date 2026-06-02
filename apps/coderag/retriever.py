@@ -23,10 +23,87 @@ from .reranker import rerank, take_top_k_distinct_files
 logger = get_logger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+_CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 
 
 def _tokenize(text: str) -> list[str]:
     return [t.lower() for t in _TOKEN_RE.findall(text)]
+
+
+def _family_tokens(component_name: str | None) -> set[str]:
+    """Tokens that should appear in a path for it to be considered relevant
+    to `component_name`. Strips common packaging suffixes and version digits.
+
+    For module paths like ``github.com/apache/thrift`` we keep only the
+    *last* segment (``thrift``) as a search token. Intermediate organisation
+    segments such as ``apache`` or ``google`` are far too broad — letting
+    them through caused unrelated code (e.g. Apache HTTPD certs) to be
+    returned as evidence for ``github.com/apache/thrift``.
+    """
+    if not component_name:
+        return set()
+    c = component_name.lower()
+    toks: set[str] = {c}
+    if "/" in c:
+        # Only the trailing path segment carries the actual library name.
+        # Discard `github.com`, organisation names, etc.
+        last = c.rsplit("/", 1)[-1].strip()
+        if last:
+            toks.add(last)
+    for suf in ("-libs", "-utils", "-common", "-dev", "-bin",
+                "-server", "-client"):
+        if c.endswith(suf):
+            toks.add(c[:-len(suf)])
+    if "-" in c and "/" not in c:
+        # Only split dashes for distro-style package names (e.g.
+        # ``bind9-libs``). For module paths we already picked the trailing
+        # segment above.
+        toks.add(c.split("-", 1)[-1])
+        toks.add(c.split("-", 1)[0])
+    if c.startswith("python3-") or c.startswith("python-"):
+        toks.add(c.split("-", 1)[1])
+    stripped = re.sub(r"[\d.]+$", "", c)
+    if stripped and stripped != c:
+        toks.add(stripped)
+    # Drop short / generic tokens that match unrelated paths.
+    GENERIC = {"lib", "libs", "bin", "src", "util", "utils", "common",
+               "dev", "server", "client", "core", "test", "tests",
+               "python", "python3", "com", "org", "net", "io", "go",
+               # Common ecosystem organisation names that are *never*
+               # specific enough on their own.
+               "apache", "google", "golang", "kubernetes", "openstack",
+               "microsoft", "amazon", "aws", "github", "gitlab"}
+    return {t for t in toks if len(t) >= 3 and t not in GENERIC}
+
+
+_DEMOTE_PATH_TOKENS = (
+    "/test/", "/tests/", "_test", "_tests", "/doc/", "/docs/",
+    "/example", "/sample", "/contrib/", "/packaging/", "/debian/",
+    "rsync-exclude", "makefile", "/mk/", ".sh", ".txt", ".md",
+    ".cfg", ".ini", ".conf", ".yaml", ".yml", "/manifest",
+    "show_upgrade", "upgrade_path",
+)
+
+
+def _path_quality(path: str) -> float:
+    p = path.lower()
+    s = 0.0
+    for tok in _DEMOTE_PATH_TOKENS:
+        if tok in p:
+            s -= 0.5
+    if p.endswith((".c", ".h", ".cc", ".cpp", ".py", ".go", ".rs",
+                   ".pl", ".pm", ".java", ".js", ".ts")):
+        s += 0.3
+    return s
+
+
+def _filter_by_family(hits: list[dict], family: set[str]) -> list[dict]:
+    """Drop hits whose path doesn't mention any family token. Returns an
+    empty list when no path matches — surfacing unrelated code as "evidence"
+    is worse than admitting the component isn't present in-tree."""
+    if not family:
+        return hits
+    return [h for h in hits if any(t in (h.get("path", "")).lower() for t in family)]
 
 
 @dataclass
@@ -121,6 +198,7 @@ class Retriever:
     ) -> dict:
         """Return {"hits": [...], "source": "index|file_fetch|none"}."""
         keywords = [k for k in [component_name, cve_id, *extra_keywords] if k]
+        family = _family_tokens(component_name)
         index_hits: list[dict] = []
         source = "none"
 
@@ -132,6 +210,11 @@ class Retriever:
                     query_terms.extend(_tokenize(kw))
                 index_hits = self._score_query(handle, query_terms)
                 index_hits = rerank(index_hits, component_name, cve_id)
+                # Apply path-quality demotion + family filter before truncation.
+                for h in index_hits:
+                    h["score"] = float(h.get("score", 0.0)) + _path_quality(h.get("path", ""))
+                index_hits.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+                index_hits = _filter_by_family(index_hits, family)
                 index_hits = take_top_k_distinct_files(
                     index_hits, self.cfg.max_files_per_query
                 )
@@ -149,12 +232,16 @@ class Retriever:
 
         # Fallback: file-fetch keyword scan.
         if repo_root:
+            # Put component_name FIRST so file_fetch's own family-token
+            # extraction keys off the real component, not description noise.
+            ff_keywords = [k for k in [component_name, *extra_keywords, cve_id] if k]
             file_hits = file_fetch.grep_keyword_windows(
                 repo_root,
-                keywords,
+                ff_keywords,
                 window_lines=self.cfg.fallback_window_lines,
                 max_files=self.cfg.max_files_per_query,
             )
+            file_hits = _filter_by_family(file_hits, family)
             if file_hits:
                 # Decorate with index-like fields and score so callers can use uniformly.
                 decorated = [

@@ -739,10 +739,23 @@ def create_app(config_path: str | None = None) -> FastAPI:
                             except (OSError, json.JSONDecodeError):
                                 pass
                         # Surface Ubuntu enrichment in run_artifact so the
-                        # XLSX "Ubuntu Status" columns populate.
+                        # XLSX "Ubuntu Status" columns populate. The
+                        # bundle has historically stored this under
+                        # advisory_status.ubuntu (when advisory_status
+                        # is a dict) or as a top-level ubuntu_security
+                        # block on newer runs — accept both shapes.
                         bundle = evidence_bundles.get(r.cve_id) or {}
-                        ubu = (bundle.get("advisory_status") or {}).get("ubuntu") or {}
-                        if ubu.get("queried"):
+                        ubu: dict[str, Any] = {}
+                        adv = bundle.get("advisory_status")
+                        if isinstance(adv, dict):
+                            cand = adv.get("ubuntu")
+                            if isinstance(cand, dict):
+                                ubu = cand
+                        if not ubu:
+                            cand2 = bundle.get("ubuntu_security")
+                            if isinstance(cand2, dict):
+                                ubu = cand2
+                        if ubu.get("queried") or ubu.get("ok") or ubu.get("status"):
                             run_artifact_dict["ubuntu_security_api_results"].append({
                                 "cve_id": r.cve_id,
                                 "ok": ubu.get("ok"),
@@ -919,6 +932,19 @@ def create_app(config_path: str | None = None) -> FastAPI:
             cid = ev.get("cve_id")
             if cid:
                 sev_by_cve[cid] = ev
+        # Index latest HITL decisions so the UI can show human overrides
+        # alongside the model verdict.
+        decisions_by_cve: dict[str, dict[str, Any]] = {}
+        dec_dir = _runs_dir(cfg) / "decisions" / run_id
+        if dec_dir.is_dir():
+            for p in dec_dir.glob("*.json"):
+                try:
+                    rec = json.loads(p.read_text(encoding="utf-8"))
+                    latest = rec.get("latest") or {}
+                    if isinstance(latest, dict):
+                        decisions_by_cve[p.stem] = latest
+                except (OSError, json.JSONDecodeError):
+                    continue
         results: list[dict[str, Any]] = []
         if artifact:
             ar = (artifact.get("analysis_result") or artifact).get("results") or []
@@ -943,13 +969,25 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     conf = {}
                 cid = r.get("cve_id")
                 sev = sev_by_cve.get(cid or "", {})
+                dec = decisions_by_cve.get(cid or "", {})
+                model_verdict = routing.get("final_verdict")
+                effective_verdict = (
+                    dec.get("new_verdict")
+                    if dec.get("action") == "reassign" and dec.get("new_verdict")
+                    else model_verdict
+                )
                 results.append({
                     "cve_id": cid,
                     "component": comp.get("name"),
                     "version": comp.get("current_version"),
                     "severity": sev.get("severity"),
                     "cvss": sev.get("cvss"),
-                    "verdict": routing.get("final_verdict"),
+                    "verdict": effective_verdict,
+                    "model_verdict": model_verdict,
+                    "human_action": dec.get("action"),
+                    "human_verdict": dec.get("new_verdict"),
+                    "human_actor": dec.get("actor"),
+                    "human_note": dec.get("note"),
                     "decision": routing.get("decision"),
                     "auto_proceed": routing.get("auto_proceed"),
                     "has_patch": bool(fix.get("patch_unified_diff")),
@@ -965,13 +1003,24 @@ def create_app(config_path: str | None = None) -> FastAPI:
         # rows immediately and fill in verdicts as events arrive.
         if not results and sev_by_cve:
             for cid, sev in sev_by_cve.items():
+                dec = decisions_by_cve.get(cid, {})
+                effective_verdict = (
+                    dec.get("new_verdict")
+                    if dec.get("action") == "reassign" and dec.get("new_verdict")
+                    else None
+                )
                 results.append({
                     "cve_id": cid,
                     "component": sev.get("component"),
                     "version": sev.get("version"),
                     "severity": sev.get("severity"),
                     "cvss": sev.get("cvss"),
-                    "verdict": None,
+                    "verdict": effective_verdict,
+                    "model_verdict": None,
+                    "human_action": dec.get("action"),
+                    "human_verdict": dec.get("new_verdict"),
+                    "human_actor": dec.get("actor"),
+                    "human_note": dec.get("note"),
                     "decision": None,
                     "auto_proceed": None,
                     "has_patch": False,
@@ -1088,6 +1137,50 @@ def create_app(config_path: str | None = None) -> FastAPI:
             envelope.update(match)  # routing, fix, triage, verifier, etc.
         elif analysis_only:
             envelope["analysis_partial"] = True
+        # Attach the latest HITL decision (if any) and expose an
+        # `effective_verdict` so the UI can render the human override
+        # without re-fetching the decisions endpoint.
+        dec_path = _runs_dir(cfg) / "decisions" / run_id / f"{cve_id}.json"
+        if dec_path.exists():
+            try:
+                dec_rec = json.loads(dec_path.read_text(encoding="utf-8"))
+                latest = (dec_rec.get("latest") or {}) if isinstance(dec_rec, dict) else {}
+                if latest:
+                    envelope["decision"] = {
+                        "latest": latest,
+                        "history": dec_rec.get("history") or [],
+                        "reanalysis": dec_rec.get("reanalysis"),
+                    }
+                    model_verdict = (
+                        (envelope.get("routing") or {}).get("final_verdict")
+                        if isinstance(envelope.get("routing"), dict)
+                        else None
+                    )
+                    envelope["model_verdict"] = model_verdict
+                    if latest.get("action") == "reassign" and latest.get("new_verdict"):
+                        envelope["effective_verdict"] = latest["new_verdict"]
+                        envelope["verdict"] = latest["new_verdict"]
+                    else:
+                        envelope["effective_verdict"] = model_verdict
+                    # If a HITL-triggered re-analysis has landed, surface
+                    # its evidence/fix in place of (or alongside) the
+                    # original so the UI shows the post-reassign result.
+                    rean = dec_rec.get("reanalysis") if isinstance(dec_rec, dict) else None
+                    if isinstance(rean, dict) and rean.get("analysis_id"):
+                        rean_dir = _artifacts_dir(cfg) / rean["analysis_id"] / cve_id
+                        for fname, key in (
+                            ("evidence_bundle.json", "reanalysis_evidence"),
+                            ("fix_proposal.json", "reanalysis_fix"),
+                            ("routing_decision.json", "reanalysis_routing"),
+                        ):
+                            fp = rean_dir / fname
+                            if fp.exists():
+                                try:
+                                    envelope[key] = json.loads(fp.read_text(encoding="utf-8"))
+                                except (OSError, json.JSONDecodeError):
+                                    pass
+            except (OSError, json.JSONDecodeError):
+                pass
         return JSONResponse(envelope)
 
     # ------------------------------------------------------------------
@@ -1928,6 +2021,73 @@ def create_app(config_path: str | None = None) -> FastAPI:
         path.write_text(json.dumps(record, indent=2), encoding="utf-8")
         log_event(logger, "hitl.decision",
                   run_id=run_id, cve_id=cve_id, action=action, actor=actor)
+
+        # If the human reassigned this CVE to code_change, kick off a
+        # focused single-CVE re-analysis so the UI can show fresh
+        # code_evidence + fix_proposal (or confirm not-vulnerable) for
+        # the override. Runs in a background thread so the request returns
+        # immediately; result lands at .data/analyses/<aid>/<cve>/ and a
+        # pointer is written back into the decision record.
+        if action == "reassign" and new_verdict == "code_change":
+            def _reanalyze() -> None:
+                try:
+                    import sys as _sys
+                    root = str(Path(__file__).resolve().parents[2])
+                    if root not in _sys.path:
+                        _sys.path.insert(0, root)
+                    from scripts.analyze_dt_findings import (  # noqa: WPS433
+                        filter_findings, load_findings, to_event,
+                    )
+                    start = _read_start_meta(cfg, run_id) or {}
+                    vulns_path = start.get("vulns_path")
+                    repo_root = start.get("repo_root")
+                    if not vulns_path or not Path(vulns_path).exists():
+                        log_event(logger, "hitl.reanalyze.skip",
+                                  run_id=run_id, cve_id=cve_id,
+                                  reason="vulns_path missing")
+                        return
+                    findings, build_context = load_findings(Path(vulns_path).resolve())
+                    if repo_root:
+                        build_context["repo_root"] = str(repo_root)
+                    # Filter to just this CVE.
+                    matching = [
+                        f for f in findings
+                        if (f.get("vulnerability") or {}).get("vulnId") == cve_id
+                    ]
+                    if not matching:
+                        log_event(logger, "hitl.reanalyze.skip",
+                                  run_id=run_id, cve_id=cve_id,
+                                  reason="cve not in source findings")
+                        return
+                    events = [to_event(f, build_context) for f in matching]
+                    with orch_swap_lock:
+                        req = AnalyzeRequest(mode="full", cves=events)
+                        resp = orch.analyze(req)
+                    # Persist a pointer back into the decision ledger.
+                    try:
+                        cur = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        cur = record
+                    cur["reanalysis"] = {
+                        "analysis_id": resp.analysis_id,
+                        "ts": time.time(),
+                        "verdict": (
+                            resp.results[0].routing.final_verdict.value
+                            if resp.results else None
+                        ),
+                    }
+                    path.write_text(json.dumps(cur, indent=2), encoding="utf-8")
+                    log_event(logger, "hitl.reanalyze.done",
+                              run_id=run_id, cve_id=cve_id,
+                              analysis_id=resp.analysis_id,
+                              verdict=cur["reanalysis"]["verdict"])
+                except Exception as exc:  # noqa: BLE001
+                    log_event(logger, "hitl.reanalyze.failed",
+                              run_id=run_id, cve_id=cve_id, error=str(exc))
+
+            threading.Thread(target=_reanalyze, daemon=True).start()
+            record["reanalysis_pending"] = True
+
         return JSONResponse(record)
 
     @app.get("/runs/{run_id}/cves/{cve_id}/decision")

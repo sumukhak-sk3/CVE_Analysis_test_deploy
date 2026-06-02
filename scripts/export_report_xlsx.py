@@ -86,8 +86,15 @@ def build_workbook(report: dict) -> Workbook:
     ]
 
     from collections import Counter
-    dec = Counter(r["routing"]["decision"] for r in results)
-    ver = Counter(r["routing"]["final_verdict"] for r in results)
+    # Be defensive: legacy / recovered runs may carry flat result stubs
+    # without a nested routing object.
+    def _routing(r: dict) -> dict:
+        rt = r.get("routing")
+        if isinstance(rt, dict):
+            return rt
+        return {"decision": r.get("decision"), "final_verdict": r.get("verdict") or r.get("final_verdict")}
+    dec = Counter(_routing(r).get("decision") or "unknown" for r in results)
+    ver = Counter(_routing(r).get("final_verdict") or "unknown" for r in results)
     for k, v in dec.items():
         summary_pairs.append((f"decisions.{k}", v))
     for k, v in ver.items():
@@ -117,14 +124,16 @@ def build_workbook(report: dict) -> Workbook:
         others_txt = ", ".join(
             f"{x.get('release')}={x.get('fixed_version')}" for x in others
         )
+        rt = _routing(r)
+        cf = r.get("confidence") or {}
         ws.append([
-            r["cve_id"],
-            comp.get("name"),
-            comp.get("current_version"),
-            (r.get("evidence_bundle", {}) or {}).get("severity") or comp.get("severity") or "",
-            r["routing"]["final_verdict"],
-            r["routing"]["decision"],
-            r["routing"].get("auto_proceed"),
+            r.get("cve_id"),
+            comp.get("name") if isinstance(comp, dict) else str(comp),
+            comp.get("current_version") if isinstance(comp, dict) else "",
+            (r.get("evidence_bundle", {}) or {}).get("severity") or (comp.get("severity") if isinstance(comp, dict) else "") or "",
+            rt.get("final_verdict") or "",
+            rt.get("decision") or "",
+            rt.get("auto_proceed"),
             ubu.get("status") or "",
             ubu.get("priority") or "",
             ubu.get("release_status") or "",
@@ -132,10 +141,10 @@ def build_workbook(report: dict) -> Workbook:
             others_txt,
             _short(exp.get("suggested_remediation"), 300),
             ", ".join(ubu.get("usn_ids") or []),
-            r["confidence"]["triage_confidence"],
-            r["confidence"]["fix_confidence"],
-            r["confidence"]["evidence_confidence"],
-            _short(r["routing"].get("reason"), 300),
+            cf.get("triage_confidence"),
+            cf.get("fix_confidence"),
+            cf.get("evidence_confidence"),
+            _short(rt.get("reason"), 300),
         ])
     _wrap_rows(ws)
     _autosize(ws)
@@ -155,9 +164,9 @@ def build_workbook(report: dict) -> Workbook:
         exp = r.get("explanation", {}) or {}
         triage = r.get("triage", {}) or {}
         ws.append([
-            r["cve_id"],
-            comp.get("name"),
-            comp.get("current_version"),
+            r.get("cve_id"),
+            comp.get("name") if isinstance(comp, dict) else str(comp),
+            comp.get("current_version") if isinstance(comp, dict) else "",
             exp.get("triggered_rule") or "",
             _short(exp.get("severity_reasoning"), 500),
             _short(exp.get("reachability_reason"), 500),
@@ -179,7 +188,9 @@ def build_workbook(report: dict) -> Workbook:
         "USNs", "Source URL", "Remediation", "Description",
     ])
     for r in results:
-        cve = r["cve_id"]
+        cve = r.get("cve_id")
+        if not cve:
+            continue
         bundle = bundles.get(cve, {}) or {}
         ubu = bundle.get("ubuntu_security") or ubuntu_by_cve.get(cve) or {}
         if not ubu:

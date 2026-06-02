@@ -27,12 +27,19 @@ def _load_prompt(prompts_dir: str | Path) -> tuple[str, str]:
 
 
 _DIFF_FILE_RE = re.compile(r"^\+\+\+\s+(?:b/)?(.+?)\s*$", re.MULTILINE)
+_APPLY_PATCH_FILE_RE = re.compile(
+    r"^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+?)\s*$", re.MULTILINE
+)
 
 
 def _diff_stats(diff: str) -> tuple[list[str], int, int]:
     if not diff:
         return [], 0, 0
     files = sorted(set(m.group(1) for m in _DIFF_FILE_RE.finditer(diff)))
+    if not files:
+        # Backstop: some models emit the OpenAI apply_patch dialect
+        # (`*** Update File: path`) instead of standard unified diff headers.
+        files = sorted(set(m.group(1) for m in _APPLY_PATCH_FILE_RE.finditer(diff)))
     added = 0
     removed = 0
     for line in diff.splitlines():

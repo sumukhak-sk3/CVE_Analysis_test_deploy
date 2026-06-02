@@ -37,6 +37,7 @@ def build_verification_packet(
     *,
     config_snippets: list[dict] | None = None,
     deterministic_results: dict | None = None,
+    patched_code_snippets: list[dict] | None = None,
 ) -> dict:
     """The sealed packet handed to the verifier — no repo access permitted."""
     return {
@@ -57,6 +58,7 @@ def build_verification_packet(
             }
             for c in bundle.code_evidence
         ],
+        "patched_code_snippets": patched_code_snippets or [],
         "config_snippets": config_snippets or [],
         "authored_patch": fix.patch_unified_diff,
         "author_rationale": fix.rationale,
@@ -78,6 +80,7 @@ def run_verifier(
     *,
     config_snippets: list[dict] | None = None,
     deterministic_results: dict | None = None,
+    patched_code_snippets: list[dict] | None = None,
 ) -> VerifierResult:
     system, version = _load_prompt(prompts_dir)
     packet = build_verification_packet(
@@ -85,6 +88,7 @@ def run_verifier(
         fix,
         config_snippets=config_snippets,
         deterministic_results=deterministic_results,
+        patched_code_snippets=patched_code_snippets,
     )
     result = client.call_json(
         role=ModelClient.VERIFIER,

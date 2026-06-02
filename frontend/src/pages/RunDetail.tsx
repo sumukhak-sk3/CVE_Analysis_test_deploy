@@ -16,9 +16,13 @@ interface RunEnvelope {
 type CVELive = {
   cve_id: string;
   verdict?: string;
+  model_verdict?: string | null;
+  human_action?: string | null;
   component?: string;
   severity?: string;
   state?: "queued" | "running" | "completed" | "failed";
+  has_patch?: boolean;
+  files_touched?: string[];
 };
 
 const TAB_ORDER: Verdict[] = [
@@ -76,41 +80,75 @@ export default function RunDetail() {
     };
   }, [runId]);
 
-  // Derive a live CVE table from events + REST snapshot
+  // Derive a live CVE table from events + REST snapshot.
+  // The SBOM can produce multiple rows for the same CVE id (one per
+  // affected component), so we key by `cve_id|component` to keep them
+  // distinct. Events only carry `cve_id`, so they are applied to every
+  // matching component-row.
   const cves = useMemo(() => {
+    const keyOf = (cve: string, comp?: string | null) =>
+      `${cve}|${comp || ""}`;
     const map = new Map<string, CVELive>();
     for (const c of rest) {
-      map.set(c.cve_id, {
+      map.set(keyOf(c.cve_id, c.component), {
         cve_id: c.cve_id,
         verdict: c.verdict,
+        model_verdict: c.model_verdict as string | null | undefined,
+        human_action: c.human_action as string | null | undefined,
         component: c.component,
         severity: c.severity,
         state: c.state as CVELive["state"],
+        has_patch: c.has_patch,
+        files_touched: c.files_touched,
       });
     }
-    for (const ev of events) {
-      const d = ev.data || {};
-      const cve = (d as any).cve_id;
-      if (!cve) continue;
-      const cur: CVELive = map.get(cve) || { cve_id: cve, verdict: "unknown" };
-      if (ev.event === "cve.queued") cur.state = "queued";
-      if (ev.event === "cve.started") cur.state = "running";
-      if (ev.event === "cve.completed") {
-        cur.state = "completed";
-        // Orchestrator emits `final_verdict`; older builds used `verdict`.
-        const v = (d as any).final_verdict ?? (d as any).verdict;
-        if (v) cur.verdict = v;
+    const findMatches = (cve: string, comp?: string | null): CVELive[] => {
+      if (comp) {
+        const exact = map.get(keyOf(cve, comp));
+        if (exact) return [exact];
       }
-      if (ev.event === "cve.failed") cur.state = "failed";
-      if ((d as any).component && !cur.component)
-        cur.component = (d as any).component;
-      if ((d as any).severity && !cur.severity)
-        cur.severity = (d as any).severity;
-      map.set(cve, cur);
+      // Fall back to every row that shares this cve_id.
+      return Array.from(map.values()).filter((r) => r.cve_id === cve);
+    };
+    for (const ev of events) {
+      const d = (ev.data || {}) as any;
+      const cve = d.cve_id;
+      if (!cve) continue;
+      let targets = findMatches(cve, d.component);
+      if (targets.length === 0) {
+        // First time we see this CVE — create a placeholder row.
+        const placeholder: CVELive = {
+          cve_id: cve,
+          verdict: "unknown",
+          component: d.component,
+        };
+        map.set(keyOf(cve, d.component), placeholder);
+        targets = [placeholder];
+      }
+      for (const cur of targets) {
+        if (ev.event === "cve.queued") cur.state = "queued";
+        if (ev.event === "cve.started") cur.state = "running";
+        if (ev.event === "cve.completed") {
+          cur.state = "completed";
+          const v = d.final_verdict ?? d.verdict;
+          // A human reassignment is authoritative — don't let a later
+          // re-analysis event silently overwrite it. The model's new
+          // verdict is preserved separately as model_verdict.
+          if (v && cur.human_action !== "reassign") cur.verdict = v;
+          if (v && cur.human_action === "reassign" && !cur.model_verdict) {
+            cur.model_verdict = v;
+          }
+        }
+        if (ev.event === "cve.failed") cur.state = "failed";
+        if (d.component && !cur.component) cur.component = d.component;
+        if (d.severity && !cur.severity) cur.severity = d.severity;
+      }
     }
-    return Array.from(map.values()).sort((a, b) =>
-      a.cve_id.localeCompare(b.cve_id),
-    );
+    return Array.from(map.values()).sort((a, b) => {
+      const byCve = a.cve_id.localeCompare(b.cve_id);
+      if (byCve !== 0) return byCve;
+      return (a.component || "").localeCompare(b.component || "");
+    });
   }, [rest, events]);
 
   // Determine total CVEs even when no run.total event has fired yet.
@@ -148,6 +186,15 @@ export default function RunDetail() {
   for (const c of cves) {
     const v = (c.verdict || "unknown").toLowerCase();
     (grouped[v] ?? grouped.unknown).push(c);
+    // When a human reassigned the verdict, also surface the row under its
+    // original (model) verdict so operators can still find it where it
+    // first appeared.
+    if (c.human_action === "reassign" && c.model_verdict) {
+      const mv = c.model_verdict.toLowerCase();
+      if (mv && mv !== v && grouped[mv]) {
+        grouped[mv].push(c);
+      }
+    }
   }
 
   return (
@@ -234,6 +281,8 @@ export default function RunDetail() {
         </div>
       </div>
 
+      <FilesModifiedPanel cves={cves} runId={runId!} />
+
       <div className="tabs">
         <button
           className={`tab ${activeTab === "all" ? "active" : ""}`}
@@ -270,6 +319,52 @@ export default function RunDetail() {
   );
 }
 
+function FilesModifiedPanel({
+  cves,
+  runId,
+}: {
+  cves: CVELive[];
+  runId: string;
+}) {
+  // Aggregate every file touched by an authored patch across the run.
+  // For each file we keep the count of CVEs that touched it and the first
+  // CVE id, so the operator can click through to see the diff.
+  const byFile = new Map<string, { count: number; firstCve: string }>();
+  for (const c of cves) {
+    if (!c.has_patch || !c.files_touched?.length) continue;
+    for (const f of c.files_touched) {
+      const cur = byFile.get(f);
+      if (cur) cur.count += 1;
+      else byFile.set(f, { count: 1, firstCve: c.cve_id });
+    }
+  }
+  if (byFile.size === 0) return null;
+  const entries = Array.from(byFile.entries()).sort((a, b) =>
+    a[0].localeCompare(b[0]),
+  );
+  return (
+    <div className="card">
+      <h3 style={{ marginTop: 0 }}>Files modified ({entries.length})</h3>
+      <div className="muted" style={{ marginBottom: 8 }}>
+        Source files that authored patches in this run will change. Click a file
+        to see the patch for the first CVE that touched it.
+      </div>
+      <ul style={{ margin: 0, paddingLeft: 18 }}>
+        {entries.map(([file, info]) => (
+          <li key={file}>
+            <Link to={`/runs/${runId}/cves/${info.firstCve}`}>
+              <code>{file}</code>
+            </Link>{" "}
+            <span className="muted">
+              · {info.count} CVE{info.count === 1 ? "" : "s"}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 function CVETable({ rows, runId }: { rows: CVELive[]; runId: string }) {
   if (!rows.length) return <div className="empty">No CVEs in this group.</div>;
   return (
@@ -286,7 +381,7 @@ function CVETable({ rows, runId }: { rows: CVELive[]; runId: string }) {
       <tbody>
         {rows.map((c) => (
           <tr
-            key={c.cve_id}
+            key={`${c.cve_id}|${c.component || ""}`}
             style={{ cursor: "pointer" }}
             onClick={(e) => {
               // ignore clicks on the link itself
@@ -306,6 +401,17 @@ function CVETable({ rows, runId }: { rows: CVELive[]; runId: string }) {
             </td>
             <td>
               <VerdictBadge verdict={c.verdict} />
+              {c.human_action === "reassign" &&
+                c.model_verdict &&
+                c.model_verdict !== c.verdict && (
+                  <span
+                    className="badge unknown"
+                    style={{ marginLeft: 6 }}
+                    title={`Human override (model said ${c.model_verdict})`}
+                  >
+                    overridden
+                  </span>
+                )}
             </td>
           </tr>
         ))}

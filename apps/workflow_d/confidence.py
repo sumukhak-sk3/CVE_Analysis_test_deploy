@@ -33,6 +33,8 @@ def compute_confidence(
     fix: FixProposal | None,
     verifier: VerifierResult | None,
     policy: ConfidencePolicy,
+    *,
+    deterministic_results: dict | None = None,
 ) -> ConfidenceScores:
     triage_c = triage.triage_confidence
     fix_c = fix.fix_confidence if fix else 0.0
@@ -42,8 +44,17 @@ def compute_confidence(
     # verifier (i.e. when there is a code change to verify).
     if verifier and triage.verdict == Verdict.code_change:
         if verifier.verdict in (VerifierVerdict.fail, VerifierVerdict.uncertain):
-            fix_c = max(0.0, fix_c - policy.verifier_disagreement_penalty)
-            triage_c = max(0.0, triage_c - policy.verifier_disagreement_penalty / 2)
+            penalty = policy.verifier_disagreement_penalty
+            # If the patch passed `git apply --check`, the structural risk is
+            # already retired — uncertainty from the LLM is most often a
+            # context-window issue, not evidence of a broken patch. Halve the
+            # penalty so a clean-applying patch with author-confidence >= 0.5
+            # can still clear the auto-proceed gate.
+            gac = (deterministic_results or {}).get("git_apply_check") or {}
+            if gac.get("ok"):
+                penalty = penalty * 0.5
+            fix_c = max(0.0, fix_c - penalty)
+            triage_c = max(0.0, triage_c - penalty / 2)
 
     return ConfidenceScores(
         triage_confidence=round(triage_c, 3),

@@ -62,6 +62,11 @@ export interface RunEvent {
 export interface CVERow {
   cve_id: string;
   verdict: Verdict | string;
+  model_verdict?: Verdict | string | null;
+  human_action?: string | null;
+  human_verdict?: Verdict | string | null;
+  human_actor?: string | null;
+  human_note?: string | null;
   component?: string;
   version?: string;
   severity?: string;

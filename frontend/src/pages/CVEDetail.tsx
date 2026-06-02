@@ -102,6 +102,16 @@ export default function CVEDetail() {
             {fields.component && (
               <span className="muted">in {safeText(fields.component)}</span>
             )}
+            {data?.decision?.latest?.action === "reassign" &&
+              data?.model_verdict &&
+              data.model_verdict !== fields.verdict && (
+                <span
+                  className="badge unknown"
+                  title={`Original model verdict: ${data.model_verdict}`}
+                >
+                  Human override (was {String(data.model_verdict)})
+                </span>
+              )}
           </div>
         </div>
         <div className="row">
@@ -117,7 +127,10 @@ export default function CVEDetail() {
       {data && (
         <>
           <Summary fields={fields} />
-          <FixPatchPanel runId={runId!} cveId={cveId!} data={data} />
+          {String(fields.verdict || "").toLowerCase() === "code_change" && (
+            <FixPatchPanel runId={runId!} cveId={cveId!} data={data} />
+          )}
+          <ReanalysisPanel data={data} />
           <HITLPanel
             decision={decision}
             onSubmit={submitDecision}
@@ -152,6 +165,7 @@ interface Fields {
   reachability_reason?: string;
   exploitability_reason?: string;
   suggested_remediation?: string;
+  suggested_next_step?: string;
   ubuntu_security?: any;
   confidence?: any;
   cwe?: string;
@@ -248,6 +262,12 @@ function extractFields(d: any): Fields {
       "evidence_bundle.ubuntu_security.remediation",
       "routing.suggested_remediation",
     ),
+    suggested_next_step: get(
+      d,
+      "routing.next_step",
+      "fix.next_step",
+      "next_step",
+    ),
     ubuntu_security: get(d, "evidence_bundle.ubuntu_security", "ubuntu_security"),
     confidence: get(d, "confidence", "verifier.confidence", "routing.confidence"),
     cwe: get(d, "cwe", "event.cwe", "evidence_bundle.cve_event.cwe"),
@@ -284,6 +304,30 @@ function extractFields(d: any): Fields {
   return f;
 }
 
+function nextStepFor(fields: Fields): string {
+  // Prefer an explicit, model-supplied next step. Otherwise fall back to a
+  // verdict-specific default so the UI always tells the operator what to do
+  // next instead of leaving the row blank.
+  if (fields.suggested_next_step && fields.suggested_next_step.trim()) {
+    return fields.suggested_next_step;
+  }
+  const verdict = (fields.verdict || "").toLowerCase();
+  switch (verdict) {
+    case "package_upgrade":
+      return fields.fixed_version
+        ? `Upgrade ${fields.component || "the component"} to ${fields.fixed_version}.`
+        : "Upgrade the component to a fixed version.";
+    case "code_change":
+      return "Review the authored patch below and apply it after testing.";
+    case "not_applicable":
+      return "No action required — confirm the component is not in the build path.";
+    case "needs_human":
+      return "Review the evidence above and approve, reject, or reassign in the human review panel.";
+    default:
+      return "Review the evidence above before deciding next steps.";
+  }
+}
+
 function Summary({ fields }: { fields: Fields }) {
   return (
     <div className="card">
@@ -297,7 +341,7 @@ function Summary({ fields }: { fields: Fields }) {
         )}
         {fields.impact && (
           <>
-            <dt>Impact</dt>
+            <dt>Why this verdict</dt>
             <dd>{safeText(fields.impact)}</dd>
           </>
         )}
@@ -355,6 +399,10 @@ function Summary({ fields }: { fields: Fields }) {
             <dd>{safeText(fields.suggested_remediation)}</dd>
           </>
         )}
+        <>
+          <dt>Suggested next step</dt>
+          <dd>{safeText(nextStepFor(fields))}</dd>
+        </>
         {fields.ubuntu_security && (
           <>
             <dt>Ubuntu security</dt>
@@ -511,6 +559,105 @@ function UbuntuSecurity({ data }: { data: any }) {
             View on Ubuntu Security Tracker ↗
           </a>
         </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Re-analysis panel: shown after a HITL reassign to code_change triggers a
+// focused re-run. Surfaces the fresh evidence + fix (or a "not vulnerable"
+// note when the codebase doesn't use the affected surface).
+// ---------------------------------------------------------------------------
+
+function ReanalysisPanel({ data }: { data: any }) {
+  const dec = data?.decision;
+  const rean = dec?.reanalysis;
+  const evidence = data?.reanalysis_evidence;
+  const fix = data?.reanalysis_fix;
+  const routing = data?.reanalysis_routing;
+  const isReassignToCode =
+    dec?.latest?.action === "reassign" &&
+    dec?.latest?.new_verdict === "code_change";
+  if (!isReassignToCode && !rean) return null;
+
+  // Pending state — decision recorded, re-analysis not finished yet.
+  if (isReassignToCode && !rean) {
+    return (
+      <div className="card">
+        <h3>Re-analysis after override</h3>
+        <p className="muted">
+          A focused re-analysis was triggered when you reassigned to{" "}
+          <code>code_change</code>. Refresh in ~30s to see the result.
+        </p>
+      </div>
+    );
+  }
+
+  const verdict = rean?.verdict || routing?.final_verdict;
+  const codeEv: any[] = evidence?.code_evidence || [];
+  const diff: string = fix?.patch_unified_diff || "";
+  const filesTouched: string[] = fix?.files_touched || [];
+
+  return (
+    <div className="card">
+      <h3>Re-analysis after override</h3>
+      <p className="muted">
+        Verdict from the post-reassign re-run:{" "}
+        <strong>{verdict || "unknown"}</strong>
+      </p>
+
+      {verdict === "not_applicable" && (
+        <p>
+          The codebase doesn't appear to use the vulnerable code path. See
+          evidence below.
+        </p>
+      )}
+
+      {codeEv.length > 0 && (
+        <details open>
+          <summary>
+            <strong>Code evidence ({codeEv.length})</strong>
+          </summary>
+          <ul>
+            {codeEv.slice(0, 8).map((e, i) => (
+              <li key={i}>
+                <code>{e.path}</code>
+                {e.start_line ? `:${e.start_line}-${e.end_line}` : ""}
+                {e.reason && <span className="muted"> — matched {e.reason}</span>}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      {filesTouched.length > 0 && (
+        <div>
+          <strong>Files modified by proposed fix:</strong>
+          <ul>
+            {filesTouched.map((f) => (
+              <li key={f}>
+                <code>{f}</code>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {diff && (
+        <details>
+          <summary>
+            <strong>Unified diff</strong>
+          </summary>
+          <pre style={{ maxHeight: 400, overflow: "auto" }}>{diff}</pre>
+        </details>
+      )}
+
+      {!codeEv.length && !diff && rean && (
+        <p className="muted">
+          Re-analysis completed but produced no code evidence or diff. The
+          component may not have upstream source available in the indexed repo.
+        </p>
       )}
     </div>
   );
@@ -679,14 +826,91 @@ function FixPatchPanel({
   const [err, setErr] = useState<string | null>(null);
 
   if (!fix || !diff) {
+    const codeEv: any[] = data?.evidence_bundle?.code_evidence || [];
+    const triageRat: string = data?.triage?.rationale || "";
+    const fixRat: string = fix?.rationale || "";
+    const override: string = fix?.verdict_override || "";
+    const remediation: string =
+      data?.evidence_bundle?.ubuntu_security?.remediation ||
+      data?.evidence_summary?.remediation ||
+      "";
+    const fixedVer: string =
+      data?.evidence_bundle?.fixed_version ||
+      data?.evidence_bundle?.ubuntu_security?.fixed_version ||
+      "";
+
     return (
       <div className="card">
         <h3>Proposed fix</h3>
-        <div className="muted">
-          No code patch was authored for this CVE. (Only CVEs triaged as{" "}
-          <code>code_change</code> get a patch; <code>upgrade_only</code> and{" "}
-          <code>not_applicable</code> verdicts produce a recommendation only.)
-        </div>
+        {override === "needs_human" ? (
+          <div className="muted" style={{ marginBottom: 8 }}>
+            The fix author could not produce a confident patch automatically and
+            flagged this for human authoring. Triage evidence and the suspected
+            vulnerable code locations are shown below so a developer can craft
+            the backport.
+          </div>
+        ) : (
+          <div className="muted" style={{ marginBottom: 8 }}>
+            No code patch was authored for this CVE.
+          </div>
+        )}
+
+        {fixRat && (
+          <details open style={{ marginBottom: 8 }}>
+            <summary>
+              <strong>Why no automatic patch</strong>
+            </summary>
+            <p style={{ whiteSpace: "pre-wrap" }}>{fixRat}</p>
+          </details>
+        )}
+
+        {(fixedVer || remediation) && (
+          <div style={{ marginBottom: 8 }}>
+            <strong>Suggested remediation:</strong>{" "}
+            {remediation || `Upgrade to ${fixedVer}.`}
+          </div>
+        )}
+
+        {triageRat && (
+          <details style={{ marginBottom: 8 }}>
+            <summary>
+              <strong>Why this is classified as a code change</strong>
+            </summary>
+            <p style={{ whiteSpace: "pre-wrap" }}>{triageRat}</p>
+          </details>
+        )}
+
+        {codeEv.length > 0 && (
+          <div>
+            <strong>
+              Suspected vulnerable code locations ({codeEv.length})
+            </strong>
+            <ul style={{ paddingLeft: 18 }}>
+              {codeEv.slice(0, 8).map((e: any, i: number) => (
+                <li key={i} style={{ marginBottom: 10 }}>
+                  <code>{e.path}</code>
+                  {e.start_line
+                    ? `:${e.start_line}-${e.end_line || e.start_line}`
+                    : ""}
+                  {e.snippet && (
+                    <details>
+                      <summary className="muted">snippet</summary>
+                      <pre
+                        style={{
+                          maxHeight: 240,
+                          overflow: "auto",
+                          fontSize: 12,
+                        }}
+                      >
+                        {String(e.snippet).slice(0, 4000)}
+                      </pre>
+                    </details>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
     );
   }

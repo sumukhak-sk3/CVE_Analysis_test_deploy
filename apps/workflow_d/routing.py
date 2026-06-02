@@ -37,13 +37,42 @@ def decide(
     confidence: ConfidenceScores,
     policy: RoutingPolicy,
     confidence_policy: ConfidencePolicy,
+    *,
+    deterministic_results: dict | None = None,
 ) -> RoutingResult:
     verdict = triage.verdict
+    det = deterministic_results or {}
+    gac = det.get("git_apply_check") or {}
 
     # Suppression based on prior decisions could be added here.
-    # Fix author may explicitly override to `needs_human`.
+    # Fix author may explicitly override to `needs_human`. We honor that for
+    # routing (don't auto-proceed) but we keep `final_verdict` as the triage
+    # classification when triage was code_change — otherwise a model that
+    # refuses to author a confident patch silently erases the analyst-visible
+    # signal that this CVE *is* code-patchable. The CVE will still land in
+    # the human_review queue because we flip the decision below.
+    fix_override_to_needs_human = False
     if fix and fix.verdict_override:
-        verdict = fix.verdict_override
+        if (
+            fix.verdict_override == Verdict.needs_human
+            and triage.verdict == Verdict.code_change
+        ):
+            fix_override_to_needs_human = True
+            # leave `verdict` as code_change so the CVE shows in the
+            # code_change bucket; routing decision below will be human_review.
+        else:
+            verdict = fix.verdict_override
+
+    if fix_override_to_needs_human:
+        return RoutingResult(
+            decision=RoutingDecision.human_review,
+            final_verdict=Verdict.code_change,
+            reason=(
+                "triage classified as code_change; fix author declined to "
+                "author a patch automatically — needs human authoring/review"
+            ),
+            auto_proceed=False,
+        )
 
     # Patch caps — applied regardless of confidence. The verdict stays
     # `code_change` (that IS the analyzer's classification); only the routing
@@ -62,8 +91,46 @@ def decide(
                 auto_proceed=False,
             )
 
-    # Verifier disagreement always blocks auto-proceed on code changes.
+    # Hard fail: a patch that `git apply --check` rejects should never
+    # auto-proceed regardless of what the verifier said. Keep verdict as
+    # code_change so the CVE remains visible in the right bucket; route to
+    # human review with the git stderr in the reason so a human can quickly
+    # see why.
+    if (
+        verdict == Verdict.code_change
+        and fix
+        and fix.patch_unified_diff
+        and gac.get("ran")
+        and not gac.get("ok")
+    ):
+        err = (gac.get("stderr") or "").splitlines()[0] if gac.get("stderr") else "unknown"
+        return RoutingResult(
+            decision=RoutingDecision.human_review,
+            final_verdict=verdict,
+            reason=f"authored patch failed `git apply --check`: {err}",
+            auto_proceed=False,
+        )
+
+    # Verifier disagreement blocks auto-proceed on code changes.
     if verdict == Verdict.code_change and verifier and verifier.verdict != VerifierVerdict.pass_:
+        # If the patch applies cleanly and the verifier merely returned
+        # "uncertain" (not "fail"), surface that distinction in the reason
+        # so the human reviewer knows this is a context-gap rather than a
+        # rejected patch.
+        if (
+            verifier.verdict == VerifierVerdict.uncertain
+            and gac.get("ok")
+        ):
+            return RoutingResult(
+                decision=RoutingDecision.human_review,
+                final_verdict=verdict,
+                reason=(
+                    "patch applies cleanly (git apply --check OK) but verifier "
+                    "could not confirm semantic correctness from the available "
+                    "snippets \u2014 quick human sanity-check required"
+                ),
+                auto_proceed=False,
+            )
         return RoutingResult(
             decision=RoutingDecision.human_review,
             final_verdict=verdict,
@@ -148,10 +215,26 @@ def decide(
                 reason="code_change verified and confident",
                 auto_proceed=True,
             )
+        # Detailed reason so analysts know exactly why this was held back.
+        missing: list[str] = []
+        if confidence.triage_confidence < confidence_policy.auto_proceed_min:
+            missing.append(f"triage_confidence={confidence.triage_confidence:.2f}")
+        if confidence.fix_confidence < confidence_policy.auto_proceed_min:
+            missing.append(f"fix_confidence={confidence.fix_confidence:.2f}")
+        if confidence.evidence_confidence < confidence_policy.auto_proceed_min:
+            missing.append(f"evidence_confidence={confidence.evidence_confidence:.2f}")
+        if missing:
+            reason = (
+                "code_change not eligible for auto-proceed: "
+                + ", ".join(missing)
+                + f" below {confidence_policy.auto_proceed_min:.2f} threshold"
+            )
+        else:
+            reason = "code_change not eligible for auto-proceed"
         return RoutingResult(
             decision=RoutingDecision.human_review,
             final_verdict=verdict,
-            reason="code_change not eligible for auto-proceed",
+            reason=reason,
             auto_proceed=False,
         )
 
