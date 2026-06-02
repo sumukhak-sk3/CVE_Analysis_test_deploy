@@ -15,6 +15,7 @@ pipeline {
     string(name: 'REPOSITORY_URL', defaultValue: '', description: 'Required: Git URL of the repository to index/analyze on the backend VM.')
     string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to index/analyze.')
     string(name: 'VULNERABILITIES_FILE_PATH', defaultValue: '', description: 'Required: absolute vulnerabilities file path on backend VM (.json/.csv/.xlsx/.xlsm).')
+    string(name: 'EXISTING_INDEX_ID', defaultValue: '', description: 'Optional: existing index id on backend VM (if provided and found, /index/build is skipped).')
     string(name: 'API_BASE_URL', defaultValue: 'http://10.120.23.89:8088', description: 'Backend API base URL reachable from Jenkins.')
     choice(name: 'ANALYSIS_MODE', choices: ['standard', 'urgent', 'ad_hoc'], description: 'Workflow D analysis mode.')
     string(name: 'SEVERITIES', defaultValue: 'CRITICAL,HIGH', description: 'Comma-separated severities for filtering findings.')
@@ -59,6 +60,7 @@ pipeline {
           REPOSITORY_URL_CLEAN="$(sanitize_param "${REPOSITORY_URL:-}")"
           BRANCH_CLEAN="$(sanitize_param "${BRANCH:-}")"
           VULNERABILITIES_FILE_PATH_CLEAN="$(sanitize_param "${VULNERABILITIES_FILE_PATH:-}")"
+          EXISTING_INDEX_ID_CLEAN="$(sanitize_param "${EXISTING_INDEX_ID:-}")"
           API_BASE_URL_CLEAN="$(sanitize_param "${API_BASE_URL:-}")"
 
           if [[ -z "$REPOSITORY_URL_CLEAN" ]]; then
@@ -131,6 +133,7 @@ export PROJECT_NAME="$PROJECT_NAME"
 export REPOSITORY_URL_CLEAN="$REPOSITORY_URL_CLEAN"
 export BRANCH_CLEAN="$BRANCH_CLEAN"
 export VULNERABILITIES_FILE_PATH_CLEAN="$VULNERABILITIES_FILE_PATH_CLEAN"
+export EXISTING_INDEX_ID_CLEAN="$EXISTING_INDEX_ID_CLEAN"
 EOF
 
           echo "RUN_DIR=$RUN_DIR"
@@ -138,6 +141,7 @@ EOF
           echo "API_BASE=$API_BASE"
           echo "PROJECT_NAME=$PROJECT_NAME"
           echo "VULNERABILITIES_FILE_PATH=$VULNERABILITIES_FILE_PATH_CLEAN"
+          echo "EXISTING_INDEX_ID=$EXISTING_INDEX_ID_CLEAN"
         '''
       }
     }
@@ -167,6 +171,43 @@ EOF
         sh '''#!/usr/bin/env bash
           set -euo pipefail
           source "$RUN_ROOT/run.env"
+
+          # If caller provided an existing index id, verify it exists and skip rebuilding.
+          if [[ -n "${EXISTING_INDEX_ID_CLEAN:-}" ]]; then
+            curl --fail --silent --show-error "$API_BASE/indexes" -o "$RUN_DIR/indexes.json"
+
+            IDX_AND_ROOT="$($PYTHON_BIN - <<PY
+import json
+from pathlib import Path
+
+target = "${EXISTING_INDEX_ID_CLEAN}".strip()
+data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
+indexes = data.get("indexes") or []
+picked = next((i for i in indexes if (i.get("id") or "") == target), None)
+if not picked:
+    raise SystemExit(f"Requested EXISTING_INDEX_ID not found on backend VM: {target}")
+print((picked.get("id") or "") + "\t" + (picked.get("repo_root") or ""))
+PY
+)"
+
+            INDEX_ID="${IDX_AND_ROOT%%$'\t'*}"
+            REPO_ROOT="${IDX_AND_ROOT#*$'\t'}"
+
+            if [[ -z "$INDEX_ID" ]]; then
+              echo "ERROR: EXISTING_INDEX_ID lookup returned empty index id" >&2
+              exit 1
+            fi
+
+            cat >> "$RUN_ROOT/run.env" <<EOF
+export INDEX_ID="$INDEX_ID"
+export REPO_ROOT="$REPO_ROOT"
+EOF
+
+            echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
+            echo "REPO_ROOT=$REPO_ROOT"
+            echo "Skipping /index/build because EXISTING_INDEX_ID was provided."
+            exit 0
+          fi
 
           INDEX_BUILD_PAYLOAD="$RUN_DIR/index_build_payload.json"
           "$PYTHON_BIN" - <<PY
