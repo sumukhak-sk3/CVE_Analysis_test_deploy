@@ -168,7 +168,7 @@ EOF
     }
 
     stage('Build Code Index (API)') {
-      options { timeout(time: 50, unit: 'MINUTES') }
+      options { timeout(time: 240, unit: 'MINUTES') }
       steps {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
@@ -436,7 +436,7 @@ EOF
     }
 
     stage('Run Vulnerability Analysis (API)') {
-      options { timeout(time: 90, unit: 'MINUTES') }
+      options { timeout(time: 240, unit: 'MINUTES') }
       steps {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
