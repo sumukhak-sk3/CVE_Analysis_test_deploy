@@ -564,11 +564,21 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-          # Upload delta CSV to backend so it can access it on its own filesystem.
+          # Convert delta CSV to JSON (backend upload endpoint requires non-CSV extension).
+          VULNS_JSON="$RUN_DIR/delta_vulns.json"
+          "$PYTHON_BIN" - <<PY
+import csv, json
+from pathlib import Path
+rows = list(csv.DictReader(Path("${VULNERABILITIES_FILE_PATH_CLEAN}").open(encoding="utf-8-sig")))
+Path("$VULNS_JSON").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+print(f"Converted delta CSV -> JSON: {len(rows)} rows -> $VULNS_JSON")
+PY
+
+          # Upload converted JSON to backend so it can access it on its own filesystem.
           UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
           UPLOAD_HTTP="$(curl --silent --show-error \
             -X POST "$API_BASE/jenkins/upload-sbom" \
-            -F "sbom_file=@${VULNERABILITIES_FILE_PATH_CLEAN};type=text/csv" \
+            -F "sbom_file=@${VULNS_JSON};type=application/json" \
             -o "$UPLOAD_BODY" \
             -w '%{http_code}')"
 
