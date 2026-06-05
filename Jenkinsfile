@@ -566,13 +566,30 @@ EOF
 
           # Convert delta CSV to JSON (backend upload endpoint requires non-CSV extension).
           VULNS_JSON="$RUN_DIR/delta_vulns.json"
-          "$PYTHON_BIN" - <<PY
+          DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
 import csv, json
 from pathlib import Path
 rows = list(csv.DictReader(Path("${VULNERABILITIES_FILE_PATH_CLEAN}").open(encoding="utf-8-sig")))
 Path("$VULNS_JSON").write_text(json.dumps(rows, indent=2), encoding="utf-8")
-print(f"Converted delta CSV -> JSON: {len(rows)} rows -> $VULNS_JSON")
+print(len(rows))
 PY
+)"
+
+          echo "Converted delta CSV -> JSON: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
+
+          if [[ "${DELTA_ROW_COUNT}" == "0" ]]; then
+            cat >> "$RUN_ROOT/run.env" <<EOF
+export SKIP_ANALYSIS="1"
+export SKIP_REASON="No new CVEs in delta"
+EOF
+
+            cat > "$RUN_DIR/run_status.json" <<EOF
+{"status":{"state":"ok","analysis_id":"skipped-no-new-cves"},"artifact":{"results":[]}}
+EOF
+
+            echo "No new CVEs in delta. Skipping /runs/start and report download."
+            exit 0
+          fi
 
           # Upload converted JSON to backend so it can access it on its own filesystem.
           UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
@@ -592,15 +609,20 @@ PY
 import json
 from pathlib import Path
 data = json.loads(Path("$UPLOAD_BODY").read_text(encoding="utf-8"))
-print((data.get("stored_path") or "").strip())
+# Prefer stored_path if backend returns it (updated backend).
+# Fall back to constructing the well-known relative path from ticket + filename.
+stored = (data.get("stored_path") or "").strip()
+if stored:
+    print(stored)
+else:
+    ticket = (data.get("ticket") or "").strip()
+    filename = (data.get("filename") or "delta_vulns.json").strip()
+    if not ticket:
+        raise SystemExit("ERROR: upload response missing both stored_path and ticket")
+    # Backend default: .data/runs/jenkins/uploads/{ticket}/{filename}
+    print(f".data/runs/jenkins/uploads/{ticket}/{filename}")
 PY
 )"
-
-          if [[ -z "$SERVER_VULNS_PATH" ]]; then
-            echo "ERROR: stored_path missing in upload response" >&2
-            cat "$UPLOAD_BODY" >&2 || true
-            exit 1
-          fi
 
           echo "Uploaded delta CSV to backend: $SERVER_VULNS_PATH"
 
@@ -692,6 +714,11 @@ PY
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
+          if [[ "${SKIP_ANALYSIS:-0}" == "1" ]]; then
+            echo "Skipping XLSX download: ${SKIP_REASON:-analysis skipped}"
+            exit 0
+          fi
+
           XLSX_PATH="$OUTPUT_DIR_ABS/${RUN_ID}.xlsx"
 
           HTTP_CODE="$(curl --silent --show-error \
@@ -728,6 +755,15 @@ EOF
         sh '''#!/usr/bin/env bash
           set -euo pipefail
           source "$RUN_ROOT/run.env"
+
+          if [[ "${SKIP_ANALYSIS:-0}" == "1" ]]; then
+            echo "Final analysis summary"
+            echo "state: ok"
+            echo "results: 0"
+            echo "note: ${SKIP_REASON:-analysis skipped}"
+            exit 0
+          fi
+
           "$PYTHON_BIN" - <<PY
 import json
 from pathlib import Path
@@ -763,7 +799,24 @@ PY
       echo 'Pipeline failed. Inspect archived API payloads/responses and logs under .jenkins_work/.'
     }
     success {
-      echo 'Pipeline completed successfully via backend API endpoints. XLSX and API traces are archived under .jenkins_work/**.'
+      script {
+        if (fileExists('.jenkins_work/run.env')) {
+          def runEnv = readFile('.jenkins_work/run.env')
+          def skipAnalysis = (runEnv =~ /(?m)^export SKIP_ANALYSIS="1"$/).find()
+          if (skipAnalysis) {
+            def skipReason = 'analysis skipped'
+            def m = (runEnv =~ /(?m)^export SKIP_REASON="([^"]*)"$/)
+            if (m.find()) {
+              skipReason = m.group(1)
+            }
+            echo "Pipeline completed successfully (${skipReason}). API traces are archived under .jenkins_work/**."
+          } else {
+            echo 'Pipeline completed successfully via backend API endpoints. XLSX and API traces are archived under .jenkins_work/**.'
+          }
+        } else {
+          echo 'Pipeline completed successfully via backend API endpoints. XLSX and API traces are archived under .jenkins_work/**.'
+        }
+      }
     }
   }
 }
