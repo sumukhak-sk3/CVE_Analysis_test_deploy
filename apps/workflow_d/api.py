@@ -1631,7 +1631,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
         if not name:
             raise HTTPException(status_code=400, detail="empty filename")
         suffix = Path(name).suffix.lower()
-        if suffix not in {".yaml", ".yml", ".json", ".xml"}:
+        if suffix not in {".yaml", ".yml", ".json", ".xml", ".csv"}:
             raise HTTPException(status_code=400, detail="unsupported SBOM file extension")
 
         content = await sbom_file.read()
@@ -1664,6 +1664,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 "ticket": ticket,
                 "filename": name,
                 "size_bytes": len(content),
+                "stored_path": str(sbom_path),
                 "state": "uploaded",
             },
             status_code=201,

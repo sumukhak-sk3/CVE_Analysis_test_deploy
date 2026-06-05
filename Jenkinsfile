@@ -564,12 +564,42 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
+          # Upload delta CSV to backend so it can access it on its own filesystem.
+          UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
+          UPLOAD_HTTP="$(curl --silent --show-error \
+            -X POST "$API_BASE/jenkins/upload-sbom" \
+            -F "sbom_file=@${VULNERABILITIES_FILE_PATH_CLEAN};type=text/csv" \
+            -o "$UPLOAD_BODY" \
+            -w '%{http_code}')"
+
+          if [[ "$UPLOAD_HTTP" != "201" ]]; then
+            echo "ERROR: /jenkins/upload-sbom failed with HTTP $UPLOAD_HTTP" >&2
+            cat "$UPLOAD_BODY" >&2 || true
+            exit 1
+          fi
+
+          SERVER_VULNS_PATH="$("$PYTHON_BIN" - <<PY
+import json
+from pathlib import Path
+data = json.loads(Path("$UPLOAD_BODY").read_text(encoding="utf-8"))
+print((data.get("stored_path") or "").strip())
+PY
+)"
+
+          if [[ -z "$SERVER_VULNS_PATH" ]]; then
+            echo "ERROR: stored_path missing in upload response" >&2
+            cat "$UPLOAD_BODY" >&2 || true
+            exit 1
+          fi
+
+          echo "Uploaded delta CSV to backend: $SERVER_VULNS_PATH"
+
           RUN_START_PAYLOAD="$RUN_DIR/run_start_payload.json"
           "$PYTHON_BIN" - <<PY
 import json
 severities = [s.strip() for s in "${SEVERITIES}".split(",") if s.strip()]
 payload = {
-  "vulns_path": "${VULNERABILITIES_FILE_PATH_CLEAN}",
+  "vulns_path": "${SERVER_VULNS_PATH}",
     "severities": severities or ["CRITICAL", "HIGH"],
     "limit": int("${LIMIT}"),
     "mode": "${ANALYSIS_MODE}",
