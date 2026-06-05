@@ -47,13 +47,26 @@ def _jenkins_get_text(url: str, username: str, token: str, timeout: int) -> str:
 
 
 def _extract_branch(console_text: str, regexes: List[str]) -> Optional[str]:
+    def _normalize_branch(candidate: str) -> str:
+        c = _trim(candidate)
+        prefixes = (
+            "refs/heads/",
+            "remotes/origin/",
+            "origin/",
+        )
+        for prefix in prefixes:
+            if c.startswith(prefix):
+                c = c[len(prefix):]
+                break
+        return c
+
     for pattern in regexes:
         try:
             matches = list(re.finditer(pattern, console_text, flags=re.IGNORECASE | re.MULTILINE))
         except re.error:
             continue
         for match in reversed(matches):
-            candidate = _trim(match.group(1) if match.groups() else "")
+            candidate = _normalize_branch(match.group(1) if match.groups() else "")
             if candidate and re.match(r"^[A-Za-z0-9._/\-]+$", candidate):
                 return candidate
     return None
