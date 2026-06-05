@@ -1,0 +1,23 @@
+{
+  "repository_url_default": "git@github.com:Infoblox-CTO/nios.git",
+  "branch_fallback": "develop/9.2",
+  "upstream": {
+    "job_builds_api_url": "https://jenkins.inca.infoblox.com/view/NIOS-CVE/job/NIOS-CVE-Analyser/job/NIOS-CVE-Build/job/NIOS-CVE-Repo/api/json?tree=builds[number,url,building,timestamp,result]{,25}",
+    "branch_regexes": [
+      "\\\"branch\\\"\\s*:\\s*\\\"([^\\\"\\\\]+)\\\"",
+      "\\\"git_branch\\\"\\s*:\\s*\\\"([^\\\"\\\\]+)\\\"",
+      "'branch'\\s*:\\s*'([^'\\\\]+)'"
+    ],
+    "max_builds_to_scan": 25,
+    "branch_poll_interval_seconds": 10,
+    "branch_poll_timeout_seconds": 600,
+    "http_timeout_seconds": 30
+  },
+  "s3": {
+    "bucket_name": "nios-dtrack-vuln-reports",
+    "prefix": "",
+    "aws_region": "us-west-1",
+    "delta_output_subdir": "s3_delta",
+    "state_file_name": ".last_processed_s3_file.json"
+  }
+}
