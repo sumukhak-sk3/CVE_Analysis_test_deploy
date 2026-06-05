@@ -59,6 +59,30 @@ def _extract_branch(console_text: str, regexes: List[str]) -> Optional[str]:
     return None
 
 
+def _scan_builds_for_branch(
+    builds: List[Dict[str, Any]],
+    regexes: List[str],
+    username: str,
+    token: str,
+    request_timeout_seconds: int,
+    source_prefix: str,
+) -> Tuple[Optional[str], str]:
+    for build in builds:
+        build_url = _trim(build.get("url"))
+        if not build_url:
+            continue
+        console_url = f"{build_url.rstrip('/')}/consoleText"
+        try:
+            text = _jenkins_get_text(console_url, username, token, request_timeout_seconds)
+        except urllib.error.URLError as exc:
+            return None, f"console_fetch_failed:{exc}"
+        branch = _extract_branch(text, regexes)
+        if branch:
+            build_num = build.get("number")
+            return branch, f"{source_prefix}_{build_num}"
+    return None, "branch_not_found"
+
+
 def _resolve_branch_from_upstream(
     upstream_cfg: Dict[str, Any],
     username: str,
@@ -85,20 +109,39 @@ def _resolve_branch_from_upstream(
         try:
             payload = _jenkins_get_json(builds_api_url, username, token, request_timeout_seconds)
             builds = payload.get("builds") or []
-            for build in builds[:max_builds]:
-                build_url = _trim(build.get("url"))
-                if not build_url:
-                    continue
-                console_url = f"{build_url.rstrip('/')}/consoleText"
-                try:
-                    text = _jenkins_get_text(console_url, username, token, request_timeout_seconds)
-                except urllib.error.URLError as exc:
-                    latest_error = f"console_fetch_failed:{exc}"
-                    continue
-                branch = _extract_branch(text, regexes)
+            candidates = builds[:max_builds]
+
+            running_builds = [b for b in candidates if bool(b.get("building"))]
+            if running_builds:
+                branch, source = _scan_builds_for_branch(
+                    running_builds,
+                    regexes,
+                    username,
+                    token,
+                    request_timeout_seconds,
+                    "upstream_running_build",
+                )
                 if branch:
-                    build_num = build.get("number")
-                    return branch, f"upstream_build_{build_num}"
+                    return branch, source
+                latest_error = source
+                time.sleep(max(interval_seconds, 1))
+                continue
+
+            successful_builds = [b for b in candidates if (b.get("result") or "").upper() == "SUCCESS"]
+            if successful_builds:
+                branch, source = _scan_builds_for_branch(
+                    successful_builds,
+                    regexes,
+                    username,
+                    token,
+                    request_timeout_seconds,
+                    "upstream_last_successful_build",
+                )
+                if branch:
+                    return branch, source
+                return None, "last_successful_build_no_branch_found"
+
+            return None, "no_running_or_successful_build_found"
         except Exception as exc:
             latest_error = str(exc)
 
