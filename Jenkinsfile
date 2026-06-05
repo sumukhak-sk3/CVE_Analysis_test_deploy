@@ -366,6 +366,10 @@ else:
   print("")
   print("")
   print("none")
+  print(f"DEBUG: no index matched project={project!r} branch={branch!r} repo_norm={norm_git(repo_url)!r}", file=sys.stderr)
+  print("DEBUG: known indexes on backend VM:", file=sys.stderr)
+  for i in indexes:
+    print(f"  id={idx_id(i)!r} project={i.get('project')!r} branch={i.get('branch')!r} git_url_norm={norm_git(i.get('git_url') or '')!r}", file=sys.stderr)
 PY
 )"
 
@@ -398,8 +402,24 @@ EOF
           INDEX_BUILD_PAYLOAD="$RUN_DIR/index_build_payload.json"
           "$PYTHON_BIN" - <<PY
 import json
+import re
+
+raw_url = "${REPOSITORY_URL_CLEAN}".strip()
+
+def ssh_to_https(u: str) -> str:
+    """Convert git@github.com:org/repo.git to https://github.com/org/repo.git"""
+    m = re.match(r'^(?:[^@]+@)?([^:/]+):(.+)$', u)
+    if m and not u.startswith('http'):
+        host = m.group(1)
+        path = m.group(2).lstrip('/')
+        return f'https://{host}/{path}'
+    return u
+
+git_url = ssh_to_https(raw_url)
+print(f"index/build git_url: {git_url}")
+
 payload = {
-        "git_url": "${REPOSITORY_URL_CLEAN}",
+        "git_url": git_url,
         "branch": "${BRANCH_CLEAN}",
     "mode": "full",
     "project": "${PROJECT_NAME}",
