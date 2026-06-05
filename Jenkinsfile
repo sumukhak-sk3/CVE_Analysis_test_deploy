@@ -175,6 +175,12 @@ EOF
                 exit 1
               fi
 
+              echo "Checking Python dependencies for automation resolver..."
+              if ! "$PYTHON_BIN" -c 'import boto3, botocore' >/dev/null 2>&1; then
+                echo "boto3/botocore not found. Installing in user site-packages..."
+                "$PYTHON_BIN" -m pip install --user --upgrade boto3 botocore
+              fi
+
               AUTO_ENV_FILE="$RUN_DIR/auto_inputs.env"
 
               "$PYTHON_BIN" scripts/resolve_automation_inputs.py \

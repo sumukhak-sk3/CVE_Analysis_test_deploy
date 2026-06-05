@@ -10,6 +10,7 @@
       "\\bbranch\\s*=\\s*([A-Za-z0-9._/\\-]+)"
     ],
     "max_builds_to_scan": 25,
+    "running_build_grace_seconds": 120,
     "branch_poll_interval_seconds": 10,
     "branch_poll_timeout_seconds": 600,
     "http_timeout_seconds": 30

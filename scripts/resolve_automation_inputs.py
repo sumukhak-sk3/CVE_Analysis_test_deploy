@@ -109,6 +109,7 @@ def _resolve_branch_from_upstream(
     interval_seconds = int(upstream_cfg.get("branch_poll_interval_seconds", 10))
     request_timeout_seconds = int(upstream_cfg.get("http_timeout_seconds", 30))
     max_builds = int(upstream_cfg.get("max_builds_to_scan", 20))
+    running_build_grace_seconds = int(upstream_cfg.get("running_build_grace_seconds", 120))
     regexes = upstream_cfg.get("branch_regexes") or [
         r'"branch"\s*:\s*"([^"\\]+)"',
         r'"git_branch"\s*:\s*"([^"\\]+)"',
@@ -116,9 +117,12 @@ def _resolve_branch_from_upstream(
     ]
 
     end_time = time.time() + timeout_seconds
+    running_wait_deadline = time.time() + max(running_build_grace_seconds, 0)
     latest_error = ""
+    poll_count = 0
 
     while time.time() < end_time:
+        poll_count += 1
         try:
             payload = _jenkins_get_json(builds_api_url, username, token, request_timeout_seconds)
             builds = payload.get("builds") or []
@@ -126,6 +130,11 @@ def _resolve_branch_from_upstream(
 
             running_builds = [b for b in candidates if bool(b.get("building"))]
             if running_builds:
+                elapsed = timeout_seconds - int(max(end_time - time.time(), 0))
+                print(
+                    f"[branch-resolver] poll={poll_count} running_builds={len(running_builds)} elapsed={elapsed}s waiting_for_branch",
+                    flush=True,
+                )
                 branch, source = _scan_builds_for_branch(
                     running_builds,
                     regexes,
@@ -135,13 +144,24 @@ def _resolve_branch_from_upstream(
                     "upstream_running_build",
                 )
                 if branch:
+                    print(f"[branch-resolver] branch found from running build: {branch}", flush=True)
                     return branch, source
                 latest_error = source
-                time.sleep(max(interval_seconds, 1))
-                continue
+                if time.time() >= running_wait_deadline:
+                    print(
+                        "[branch-resolver] running build grace window elapsed; falling back to last successful build lookup",
+                        flush=True,
+                    )
+                else:
+                    time.sleep(max(interval_seconds, 1))
+                    continue
 
             successful_builds = [b for b in candidates if (b.get("result") or "").upper() == "SUCCESS"]
             if successful_builds:
+                print(
+                    f"[branch-resolver] checking last successful builds count={len(successful_builds)}",
+                    flush=True,
+                )
                 branch, source = _scan_builds_for_branch(
                     successful_builds,
                     regexes,
@@ -151,12 +171,14 @@ def _resolve_branch_from_upstream(
                     "upstream_last_successful_build",
                 )
                 if branch:
+                    print(f"[branch-resolver] branch found from successful build: {branch}", flush=True)
                     return branch, source
                 return None, "last_successful_build_no_branch_found"
 
             return None, "no_running_or_successful_build_found"
         except Exception as exc:
             latest_error = str(exc)
+            print(f"[branch-resolver] poll={poll_count} error={latest_error}", flush=True)
 
         time.sleep(max(interval_seconds, 1))
 
