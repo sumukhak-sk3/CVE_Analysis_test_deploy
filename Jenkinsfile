@@ -356,6 +356,16 @@ if picked is None:
     picked = matches[0]
     reason = "auto"
 
+# Same-repo fallback: if no exact branch match, reuse the most recent index for
+# the same repository rather than triggering a new (potentially failing) build.
+if picked is None and repo_norm:
+  same_repo = [i for i in indexes if repo_match(i) and idx_id(i)]
+  if same_repo:
+    same_repo.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
+    picked = same_repo[0]
+    reason = "same_repo_fallback"
+    print(f"WARNING: no index for branch={branch!r}; reusing nearest same-repo index: {idx_id(picked)!r} (branch={picked.get('branch')!r})", file=sys.stderr)
+
 if picked:
   print("true")
   print(idx_id(picked))
@@ -366,7 +376,7 @@ else:
   print("")
   print("")
   print("none")
-  print(f"DEBUG: no index matched project={project!r} branch={branch!r} repo_norm={norm_git(repo_url)!r}", file=sys.stderr)
+  print(f"DEBUG: no index matched and no same-repo fallback available. project={project!r} branch={branch!r} repo_norm={repo_norm!r}", file=sys.stderr)
   print("DEBUG: known indexes on backend VM:", file=sys.stderr)
   for i in indexes:
     print(f"  id={idx_id(i)!r} project={i.get('project')!r} branch={i.get('branch')!r} git_url_norm={norm_git(i.get('git_url') or '')!r}", file=sys.stderr)
@@ -402,24 +412,8 @@ EOF
           INDEX_BUILD_PAYLOAD="$RUN_DIR/index_build_payload.json"
           "$PYTHON_BIN" - <<PY
 import json
-import re
-
-raw_url = "${REPOSITORY_URL_CLEAN}".strip()
-
-def ssh_to_https(u: str) -> str:
-    """Convert git@github.com:org/repo.git to https://github.com/org/repo.git"""
-    m = re.match(r'^(?:[^@]+@)?([^:/]+):(.+)$', u)
-    if m and not u.startswith('http'):
-        host = m.group(1)
-        path = m.group(2).lstrip('/')
-        return f'https://{host}/{path}'
-    return u
-
-git_url = ssh_to_https(raw_url)
-print(f"index/build git_url: {git_url}")
-
 payload = {
-        "git_url": git_url,
+        "git_url": "${REPOSITORY_URL_CLEAN}",
         "branch": "${BRANCH_CLEAN}",
     "mode": "full",
     "project": "${PROJECT_NAME}",
