@@ -11,12 +11,19 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
+  triggers {
+    upstream(upstreamProjects: 'NIOS-CVE/NIOS-CVE-Analyser/NIOS-CVE-Build/NIOS-CVE-Repo', threshold: hudson.model.Result.SUCCESS)
+  }
+
   parameters {
-    string(name: 'REPOSITORY_URL', defaultValue: '', description: 'Required: Git URL of the repository to index/analyze on the backend VM.')
-    string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to index/analyze.')
-    string(name: 'VULNERABILITIES_FILE_PATH', defaultValue: '', description: 'Required: absolute vulnerabilities file path on backend VM (.json/.csv/.xlsx/.xlsm).')
+    string(name: 'REPOSITORY_URL', defaultValue: 'git@github.com:Infoblox-CTO/nios.git', description: 'Git URL of the repository to index/analyze on the backend VM.')
+    string(name: 'BRANCH', defaultValue: '', description: 'Optional manual override. If empty, branch is auto-resolved from upstream Jenkins console and falls back to develop/9.2.')
+    string(name: 'VULNERABILITIES_FILE_PATH', defaultValue: '', description: 'Optional manual override. If empty, auto-generated delta CSV from latest S3 upload is used.')
     string(name: 'EXISTING_INDEX_ID', defaultValue: '', description: 'Optional: existing index id on backend VM (if provided and found, /index/build is skipped).')
     string(name: 'API_BASE_URL', defaultValue: 'http://10.120.23.89:8088', description: 'Backend API base URL reachable from Jenkins.')
+    string(name: 'AUTOMATION_CONFIG_PATH', defaultValue: 'configs/jenkins_automation.json', description: 'Config file for branch/S3 automation settings.')
+    string(name: 'JENKINS_API_CREDENTIALS_ID', defaultValue: 'jenkins-api-user-token', description: 'Credentials ID (username/password or username/token) for upstream Jenkins API auth.')
+    string(name: 'AWS_S3_CREDENTIALS_ID', defaultValue: 'aws-s3-access-key-secret', description: 'Credentials ID (username=AWS access key, password=AWS secret key) for S3 read/list access.')
     choice(name: 'ANALYSIS_MODE', choices: ['standard', 'urgent', 'ad_hoc'], description: 'Workflow D analysis mode.')
     string(name: 'SEVERITIES', defaultValue: 'CRITICAL,HIGH', description: 'Comma-separated severities for filtering findings.')
     string(name: 'LIMIT', defaultValue: '0', description: 'Maximum CVEs to analyze. Use 0 for no cap.')
@@ -31,6 +38,12 @@ pipeline {
   }
 
   stages {
+    stage('Checkout Pipeline Repo') {
+      steps {
+        checkout(scm)
+      }
+    }
+
     stage('Validate Parameters') {
       steps {
         sh '''#!/usr/bin/env bash
@@ -57,36 +70,31 @@ pipeline {
             printf '%s' "$(trim_spaces "$v")"
           }
 
-          REPOSITORY_URL_CLEAN="$(sanitize_param "${REPOSITORY_URL:-}")"
+          REPOSITORY_URL_CLEAN="$(sanitize_param "${REPOSITORY_URL:-git@github.com:Infoblox-CTO/nios.git}")"
           BRANCH_CLEAN="$(sanitize_param "${BRANCH:-}")"
           VULNERABILITIES_FILE_PATH_CLEAN="$(sanitize_param "${VULNERABILITIES_FILE_PATH:-}")"
           EXISTING_INDEX_ID_CLEAN="$(sanitize_param "${EXISTING_INDEX_ID:-}")"
           API_BASE_URL_CLEAN="$(sanitize_param "${API_BASE_URL:-}")"
+          AUTOMATION_CONFIG_PATH_CLEAN="$(sanitize_param "${AUTOMATION_CONFIG_PATH:-configs/jenkins_automation.json}")"
 
           if [[ -z "$REPOSITORY_URL_CLEAN" ]]; then
             echo "ERROR: REPOSITORY_URL is required" >&2
             exit 1
           fi
-          if [[ -z "$BRANCH_CLEAN" ]]; then
-            echo "ERROR: BRANCH is required" >&2
-            exit 1
-          fi
-          if [[ -z "$VULNERABILITIES_FILE_PATH_CLEAN" ]]; then
-            echo "ERROR: VULNERABILITIES_FILE_PATH is required" >&2
-            exit 1
-          fi
-          if [[ "$VULNERABILITIES_FILE_PATH_CLEAN" != /* ]]; then
-            echo "ERROR: VULNERABILITIES_FILE_PATH must be an absolute path on the backend VM" >&2
-            exit 1
-          fi
-          EXT_LOWER="$(echo "${VULNERABILITIES_FILE_PATH_CLEAN##*.}" | tr '[:upper:]' '[:lower:]')"
-          case "$EXT_LOWER" in
-            json|csv|xlsx|xlsm) ;;
-            *)
-              echo "ERROR: VULNERABILITIES_FILE_PATH extension must be .json/.csv/.xlsx/.xlsm (got: $VULNERABILITIES_FILE_PATH_CLEAN)" >&2
+          if [[ -n "$VULNERABILITIES_FILE_PATH_CLEAN" ]]; then
+            if [[ "$VULNERABILITIES_FILE_PATH_CLEAN" != /* ]]; then
+              echo "ERROR: VULNERABILITIES_FILE_PATH must be an absolute path when manually supplied" >&2
               exit 1
-              ;;
-          esac
+            fi
+            EXT_LOWER="$(echo "${VULNERABILITIES_FILE_PATH_CLEAN##*.}" | tr '[:upper:]' '[:lower:]')"
+            case "$EXT_LOWER" in
+              json|csv|xlsx|xlsm) ;;
+              *)
+                echo "ERROR: VULNERABILITIES_FILE_PATH extension must be .json/.csv/.xlsx/.xlsm (got: $VULNERABILITIES_FILE_PATH_CLEAN)" >&2
+                exit 1
+                ;;
+            esac
+          fi
 
           if [[ -z "$API_BASE_URL_CLEAN" ]]; then
             echo "ERROR: API_BASE_URL is required" >&2
@@ -136,21 +144,85 @@ export REPOSITORY_URL_CLEAN="$REPOSITORY_URL_CLEAN"
 export BRANCH_CLEAN="$BRANCH_CLEAN"
 export VULNERABILITIES_FILE_PATH_CLEAN="$VULNERABILITIES_FILE_PATH_CLEAN"
 export EXISTING_INDEX_ID_CLEAN="$EXISTING_INDEX_ID_CLEAN"
+export AUTOMATION_CONFIG_PATH_CLEAN="$AUTOMATION_CONFIG_PATH_CLEAN"
 EOF
 
           echo "RUN_DIR=$RUN_DIR"
           echo "OUTPUT_DIR_ABS=$OUTPUT_DIR_ABS"
           echo "API_BASE=$API_BASE"
           echo "PROJECT_NAME=$PROJECT_NAME"
+          echo "BRANCH(initial)=$BRANCH_CLEAN"
           echo "VULNERABILITIES_FILE_PATH=$VULNERABILITIES_FILE_PATH_CLEAN"
           echo "EXISTING_INDEX_ID=$EXISTING_INDEX_ID_CLEAN"
+          echo "AUTOMATION_CONFIG_PATH=$AUTOMATION_CONFIG_PATH_CLEAN"
         '''
       }
     }
 
-    stage('Checkout Pipeline Repo') {
+    stage('Resolve Automated Inputs') {
       steps {
-        checkout(scm)
+        script {
+          withCredentials([
+            usernamePassword(credentialsId: params.JENKINS_API_CREDENTIALS_ID, usernameVariable: 'JENKINS_API_USER', passwordVariable: 'JENKINS_API_TOKEN'),
+            usernamePassword(credentialsId: params.AWS_S3_CREDENTIALS_ID, usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')
+          ]) {
+            sh '''#!/usr/bin/env bash
+              set -euo pipefail
+              source "$RUN_ROOT/run.env"
+
+              if [[ ! -f "$AUTOMATION_CONFIG_PATH_CLEAN" ]]; then
+                echo "ERROR: automation config not found: $AUTOMATION_CONFIG_PATH_CLEAN" >&2
+                exit 1
+              fi
+
+              AUTO_ENV_FILE="$RUN_DIR/auto_inputs.env"
+
+              "$PYTHON_BIN" scripts/resolve_automation_inputs.py \
+                --config "$AUTOMATION_CONFIG_PATH_CLEAN" \
+                --workspace "$WORKSPACE" \
+                --run-root "$RUN_ROOT" \
+                --output-env "$AUTO_ENV_FILE" \
+                --repository-override "$REPOSITORY_URL_CLEAN" \
+                --branch-override "$BRANCH_CLEAN" \
+                --vulnerabilities-path-override "$VULNERABILITIES_FILE_PATH_CLEAN"
+
+              source "$AUTO_ENV_FILE"
+
+              if [[ -z "$AUTO_BRANCH" ]]; then
+                echo "ERROR: branch resolution produced an empty value" >&2
+                exit 1
+              fi
+              if [[ -z "$AUTO_VULNERABILITIES_FILE_PATH" ]]; then
+                echo "ERROR: vulnerabilities path resolution produced an empty value" >&2
+                exit 1
+              fi
+              if [[ "$AUTO_VULNERABILITIES_FILE_PATH" != /* ]]; then
+                echo "ERROR: resolved vulnerabilities file path must be absolute: $AUTO_VULNERABILITIES_FILE_PATH" >&2
+                exit 1
+              fi
+
+              EXT_LOWER="$(echo "${AUTO_VULNERABILITIES_FILE_PATH##*.}" | tr '[:upper:]' '[:lower:]')"
+              case "$EXT_LOWER" in
+                json|csv|xlsx|xlsm) ;;
+                *)
+                  echo "ERROR: resolved vulnerabilities file extension is invalid: $AUTO_VULNERABILITIES_FILE_PATH" >&2
+                  exit 1
+                  ;;
+              esac
+
+              cat >> "$RUN_ROOT/run.env" <<EOF
+export REPOSITORY_URL_CLEAN="$AUTO_REPOSITORY_URL"
+export BRANCH_CLEAN="$AUTO_BRANCH"
+export VULNERABILITIES_FILE_PATH_CLEAN="$AUTO_VULNERABILITIES_FILE_PATH"
+export AUTO_BRANCH_SOURCE="$AUTO_BRANCH_SOURCE"
+export AUTO_VULNERABILITIES_FILE_PATH_SOURCE="$AUTO_VULNERABILITIES_FILE_PATH_SOURCE"
+EOF
+
+              echo "Resolved BRANCH=$AUTO_BRANCH (source=$AUTO_BRANCH_SOURCE)"
+              echo "Resolved VULNERABILITIES_FILE_PATH=$AUTO_VULNERABILITIES_FILE_PATH (source=$AUTO_VULNERABILITIES_FILE_PATH_SOURCE)"
+            '''
+          }
+        }
       }
     }
 
