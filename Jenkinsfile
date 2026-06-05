@@ -280,9 +280,24 @@ def idx_id(item: dict) -> str:
 
 def norm_git(u: str) -> str:
   s = (u or "").strip().lower()
-  if s.endswith(".git"):
-    s = s[:-4]
-  return s
+  if not s:
+    return ""
+  s = re.sub(r"^(ssh://)", "", s)
+  m = re.match(r"^(?:[^@]+@)?([^:/]+)[:/](.+)$", s)
+  if m:
+    host = m.group(1)
+    path = m.group(2)
+  else:
+    m = re.match(r"^https?://([^/]+)/(.+)$", s)
+    if m:
+      host = m.group(1)
+      path = m.group(2)
+    else:
+      return s[:-4] if s.endswith(".git") else s
+  path = path.strip("/")
+  if path.endswith(".git"):
+    path = path[:-4]
+  return f"{host}/{path}"
 
 target_norm = norm(target)
 project_norm = norm(project)
@@ -453,9 +468,24 @@ def idx_id(item: dict) -> str:
 
 def norm_git(u: str) -> str:
   s = (u or "").strip().lower()
-  if s.endswith(".git"):
-    s = s[:-4]
-  return s
+  if not s:
+    return ""
+  s = re.sub(r"^(ssh://)", "", s)
+  m = re.match(r"^(?:[^@]+@)?([^:/]+)[:/](.+)$", s)
+  if m:
+    host = m.group(1)
+    path = m.group(2)
+  else:
+    m = re.match(r"^https?://([^/]+)/(.+)$", s)
+    if m:
+      host = m.group(1)
+      path = m.group(2)
+    else:
+      return s[:-4] if s.endswith(".git") else s
+  path = path.strip("/")
+  if path.endswith(".git"):
+    path = path[:-4]
+  return f"{host}/{path}"
 
 data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
 indexes = data.get("indexes") or []
