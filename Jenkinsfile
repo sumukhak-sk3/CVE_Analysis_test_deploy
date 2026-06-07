@@ -801,18 +801,15 @@ PY
     success {
       script {
         if (fileExists('.jenkins_work/run.env')) {
-          def runEnv = readFile('.jenkins_work/run.env')
-          def skipAnalysis = (runEnv =~ /(?m)^export SKIP_ANALYSIS="1"$/).find()
-          if (skipAnalysis) {
-            def skipReason = 'analysis skipped'
-            def m = (runEnv =~ /(?m)^export SKIP_REASON="([^"]*)"$/)
-            if (m.find()) {
-              skipReason = m.group(1)
-            }
-            echo "Pipeline completed successfully (${skipReason}). API traces are archived under .jenkins_work/**."
-          } else {
-            echo 'Pipeline completed successfully via backend API endpoints. XLSX and API traces are archived under .jenkins_work/**.'
-          }
+          sh '''#!/usr/bin/env bash
+            set -euo pipefail
+            source .jenkins_work/run.env
+            if [[ "${SKIP_ANALYSIS:-0}" == "1" ]]; then
+              echo "Pipeline completed successfully (${SKIP_REASON:-analysis skipped}). API traces are archived under .jenkins_work/**."
+            else
+              echo "Pipeline completed successfully via backend API endpoints. XLSX and API traces are archived under .jenkins_work/**."
+            fi
+          '''
         } else {
           echo 'Pipeline completed successfully via backend API endpoints. XLSX and API traces are archived under .jenkins_work/**.'
         }
