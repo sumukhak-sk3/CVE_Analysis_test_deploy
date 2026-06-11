@@ -12,7 +12,7 @@ pipeline {
   }
 
   triggers {
-    upstream(upstreamProjects: 'NIOS-CVE/NIOS-CVE-Analyser/NIOS-CVE-Build/NIOS-CVE-Repo', threshold: hudson.model.Result.SUCCESS)
+    upstream(upstreamProjects: 'NIOS-CVE-Build/NIOS-CVE-Repo', threshold: hudson.model.Result.SUCCESS)
   }
 
   parameters {
