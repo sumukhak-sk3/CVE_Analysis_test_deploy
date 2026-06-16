@@ -7,7 +7,7 @@ pipeline {
     timestamps()
     disableConcurrentBuilds()
     skipDefaultCheckout(true)
-    timeout(time: 120, unit: 'MINUTES')
+    timeout(time: 600, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
@@ -160,7 +160,7 @@ EOF
     }
 
     stage('Wait for New S3 Upload') {
-      options { timeout(time: 120, unit: 'MINUTES') }
+      options { timeout(time: 480, unit: 'MINUTES') }
       steps {
         script {
           withCredentials([
@@ -202,13 +202,16 @@ if not bucket:
 
 prefix = (s3_cfg.get("prefix") or "").strip()
 region = (s3_cfg.get("aws_region") or "us-west-1").strip() or "us-west-1"
-poll_timeout = int(s3_cfg.get("poll_timeout_seconds", 1800))
+poll_timeout = 7200
+pre_poll_sleep = 21600
 poll_interval = int(s3_cfg.get("poll_interval_seconds", 30))
 
 if poll_timeout <= 0:
     raise SystemExit("s3.poll_timeout_seconds must be > 0")
 if poll_interval <= 0:
     raise SystemExit("s3.poll_interval_seconds must be > 0")
+if pre_poll_sleep < 0:
+  raise SystemExit("pre-poll sleep must be >= 0")
 
 s3 = boto3.client("s3", region_name=region)
 
@@ -235,6 +238,10 @@ if baseline:
     print(f"[s3-poll] baseline key={baseline['key']} etag={baseline['etag']} last_modified={baseline['last_modified']}", flush=True)
 else:
     print("[s3-poll] baseline is empty (no CSV files yet)", flush=True)
+
+print(f"[s3-poll] sleeping for {pre_poll_sleep}s before polling for new uploads", flush=True)
+time.sleep(pre_poll_sleep)
+print(f"[s3-poll] sleep complete; starting polling window of {poll_timeout}s", flush=True)
 
 deadline = time.time() + poll_timeout
 attempt = 0
