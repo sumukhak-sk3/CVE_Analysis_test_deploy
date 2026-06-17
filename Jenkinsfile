@@ -683,66 +683,66 @@ EOF
             VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
             VULNS_JSON="$RUN_DIR/delta_vulns.json"
           DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
-import csv
-      import json
-      import re
-from pathlib import Path
+        import csv
+        import json
+        import re
+        from pathlib import Path
 
-      src = Path("$VULNS_FILE")
-      rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
+        src = Path("$VULNS_FILE")
+        rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
 
-      def g(rec, *keys):
-        norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
-        for k in keys:
-          v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
-          if v not in (None, ""):
-            return str(v).strip()
-        return ""
+        def g(rec, *keys):
+          norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
+          for k in keys:
+            v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
+            if v not in (None, ""):
+              return str(v).strip()
+          return ""
 
-      def fnum(v):
-        try:
-          return float(v) if v not in (None, "") else None
-        except Exception:
-          return None
+        def fnum(v):
+          try:
+            return float(v) if v not in (None, "") else None
+          except Exception:
+            return None
 
-      findings = []
-      for rec in rows:
-        cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
-        if not cve_id:
-          continue
-        finding = {
-          "vulnerability": {
-            "vulnId": cve_id,
-            "severity": g(rec, "Severity") or "UNASSIGNED",
-            "description": g(rec, "Description"),
-            "source": g(rec, "Source") or "NVD",
-            "published": g(rec, "Published"),
-            "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
-            "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
-            "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
-            "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
-            "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
-            "references": None,
-          },
-          "component": {
-            "name": g(rec, "Component_Name", "ComponentName"),
-            "version": g(rec, "Component_Version", "ComponentVersion"),
-            "group": g(rec, "Component_Group", "ComponentGroup"),
-            "purl": g(rec, "purl", "PURL"),
+        findings = []
+        for rec in rows:
+          cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
+          if not cve_id:
+            continue
+          finding = {
+            "vulnerability": {
+              "vulnId": cve_id,
+              "severity": g(rec, "Severity") or "UNASSIGNED",
+              "description": g(rec, "Description"),
+              "source": g(rec, "Source") or "NVD",
+              "published": g(rec, "Published"),
+              "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
+              "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
+              "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
+              "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
+              "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
+              "references": None,
+            },
+            "component": {
+              "name": g(rec, "Component_Name", "ComponentName"),
+              "version": g(rec, "Component_Version", "ComponentVersion"),
+              "group": g(rec, "Component_Group", "ComponentGroup"),
+              "purl": g(rec, "purl", "PURL"),
+            },
+          }
+          findings.append(finding)
+
+        payload = {
+          "findings": findings,
+          "project": {
+            "name": "$PROJECT_NAME",
+            "version": "$BRANCH_CLEAN",
+            "uuid": None,
           },
         }
-        findings.append(finding)
-
-      payload = {
-        "findings": findings,
-        "project": {
-          "name": "$PROJECT_NAME",
-          "version": "$BRANCH_CLEAN",
-          "uuid": None,
-        },
-      }
-      Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-print(len(rows))
+        Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(len(rows))
 PY
 )"
 
