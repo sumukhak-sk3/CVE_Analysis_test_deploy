@@ -209,23 +209,23 @@ s3 = boto3.client("s3", region_name=region)
 
 def list_csvs_sorted():
     paginator = s3.get_paginator("list_objects_v2")
-  rows = []
+    rows = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj.get("Key") or ""
             if not key or key.endswith("/") or not key.lower().endswith(".csv"):
                 continue
-      rows.append({
-        "key": key,
-        "etag": (obj.get("ETag") or "").strip('"'),
-        "last_modified": float(obj["LastModified"].timestamp()),
-      })
-  rows.sort(key=lambda r: r["last_modified"])
-  return rows
+            rows.append({
+                "key": key,
+                "etag": (obj.get("ETag") or "").strip('"'),
+                "last_modified": float(obj["LastModified"].timestamp()),
+            })
+    rows.sort(key=lambda r: r["last_modified"])
+    return rows
 
 csvs = list_csvs_sorted()
 if len(csvs) < 2:
-  raise SystemExit(f"Need at least 2 CSV uploads in s3://{bucket}/{prefix} to compute delta (found {len(csvs)})")
+    raise SystemExit(f"Need at least 2 CSV uploads in s3://{bucket}/{prefix} to compute delta (found {len(csvs)})")
 
 previous = csvs[-2]
 latest = csvs[-1]
@@ -239,10 +239,10 @@ output_dir.mkdir(parents=True, exist_ok=True)
 state_file = (output_dir / state_file_name).resolve()
 
 seed_state = {
-  "latest_key": previous["key"],
-  "latest_etag": previous["etag"],
-  "seeded_by": "jenkins_manual_latest_two",
-  "seeded_at_epoch": time.time(),
+    "latest_key": previous["key"],
+    "latest_etag": previous["etag"],
+    "seeded_by": "jenkins_manual_latest_two",
+    "seeded_at_epoch": time.time(),
 }
 state_file.write_text(json.dumps(seed_state, indent=2), encoding="utf-8")
 print(f"[s3-poll] seeded state file for delta baseline: {state_file}", flush=True)
