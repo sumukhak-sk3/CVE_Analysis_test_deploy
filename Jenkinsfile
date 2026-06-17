@@ -706,10 +706,13 @@ EOF
           fi
 
           # Upload delta CSV to backend so it can access it on its own filesystem.
+          UPLOAD_FILE="$RUN_DIR/delta_vulns.csv"
+          cp "$VULNS_FILE" "$UPLOAD_FILE"
+
           UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
           UPLOAD_HTTP="$(curl --silent --show-error \
             -X POST "$API_BASE/jenkins/upload-sbom" \
-            -F "sbom_file=@${VULNS_FILE};type=text/csv" \
+            -F "sbom_file=@${UPLOAD_FILE};filename=delta_vulns.csv;type=text/csv" \
             -o "$UPLOAD_BODY" \
             -w '%{http_code}')"
 
