@@ -368,7 +368,7 @@ payload = {
 json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 print(len(rows))
 PY
-)
+)"
 
           echo "Prepared delta payload for upload: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
           INDEX_BUILD_PAYLOAD="$RUN_DIR/index_build_payload.json"
