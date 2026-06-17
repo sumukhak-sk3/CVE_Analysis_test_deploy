@@ -7,7 +7,7 @@ pipeline {
     timestamps()
     disableConcurrentBuilds()
     skipDefaultCheckout(true)
-    timeout(time: 600, unit: 'MINUTES')
+    timeout(time: 120, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
@@ -160,7 +160,7 @@ EOF
     }
 
     stage('Wait for New S3 Upload') {
-      options { timeout(time: 480, unit: 'MINUTES') }
+      options { timeout(time: 120, unit: 'MINUTES') }
       steps {
         script {
           withCredentials([
@@ -202,80 +202,59 @@ if not bucket:
 
 prefix = (s3_cfg.get("prefix") or "").strip()
 region = (s3_cfg.get("aws_region") or "us-west-1").strip() or "us-west-1"
-poll_timeout = 7200
-pre_poll_sleep = 21600
-poll_interval = int(s3_cfg.get("poll_interval_seconds", 30))
-
-if poll_timeout <= 0:
-    raise SystemExit("s3.poll_timeout_seconds must be > 0")
-if poll_interval <= 0:
-    raise SystemExit("s3.poll_interval_seconds must be > 0")
-if pre_poll_sleep < 0:
-  raise SystemExit("pre-poll sleep must be >= 0")
+delta_subdir = (s3_cfg.get("delta_output_subdir") or "s3_delta").strip() or "s3_delta"
+state_file_name = (s3_cfg.get("state_file_name") or ".last_processed_s3_file.json").strip() or ".last_processed_s3_file.json"
 
 s3 = boto3.client("s3", region_name=region)
 
-def latest_csv():
+def list_csvs_sorted():
     paginator = s3.get_paginator("list_objects_v2")
-    latest = None
+  rows = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj.get("Key") or ""
             if not key or key.endswith("/") or not key.lower().endswith(".csv"):
                 continue
-            if latest is None or obj["LastModified"] > latest["LastModified"]:
-                latest = obj
-    if latest is None:
-        return None
-    return {
-        "key": latest["Key"],
-        "etag": (latest.get("ETag") or "").strip('"'),
-        "last_modified": float(latest["LastModified"].timestamp()),
-    }
+      rows.append({
+        "key": key,
+        "etag": (obj.get("ETag") or "").strip('"'),
+        "last_modified": float(obj["LastModified"].timestamp()),
+      })
+  rows.sort(key=lambda r: r["last_modified"])
+  return rows
 
-baseline = latest_csv()
-if baseline:
-    print(f"[s3-poll] baseline key={baseline['key']} etag={baseline['etag']} last_modified={baseline['last_modified']}", flush=True)
-else:
-    print("[s3-poll] baseline is empty (no CSV files yet)", flush=True)
+csvs = list_csvs_sorted()
+if len(csvs) < 2:
+  raise SystemExit(f"Need at least 2 CSV uploads in s3://{bucket}/{prefix} to compute delta (found {len(csvs)})")
 
-print(f"[s3-poll] sleeping for {pre_poll_sleep}s before polling for new uploads", flush=True)
-time.sleep(pre_poll_sleep)
-print(f"[s3-poll] sleep complete; starting polling window of {poll_timeout}s", flush=True)
+previous = csvs[-2]
+latest = csvs[-1]
 
-deadline = time.time() + poll_timeout
-attempt = 0
-detected = None
-while time.time() < deadline:
-    attempt += 1
-    current = latest_csv()
-    if current is not None:
-        if baseline is None:
-            detected = current
-            print(f"[s3-poll] attempt={attempt} new file detected key={current['key']}", flush=True)
-            break
-        if (
-            (current["key"] != baseline["key"] or current["etag"] != baseline["etag"]) and
-            current["last_modified"] >= baseline["last_modified"]
-        ):
-            detected = current
-            print(f"[s3-poll] attempt={attempt} new file detected key={current['key']}", flush=True)
-            break
+print(f"[s3-poll] using previous key={previous['key']} etag={previous['etag']}", flush=True)
+print(f"[s3-poll] using latest key={latest['key']} etag={latest['etag']}", flush=True)
 
-    remaining = int(max(deadline - time.time(), 0))
-    current_key = (current or {}).get("key", "<none>")
-    print(f"[s3-poll] attempt={attempt} waiting... latest={current_key} remaining={remaining}s", flush=True)
-    time.sleep(poll_interval)
+run_root = Path("${RUN_ROOT}")
+output_dir = (run_root / delta_subdir).resolve()
+output_dir.mkdir(parents=True, exist_ok=True)
+state_file = (output_dir / state_file_name).resolve()
 
-if detected is None:
-    raise SystemExit(f"Timed out after {poll_timeout}s waiting for new S3 CSV upload in s3://{bucket}/{prefix}")
+seed_state = {
+  "latest_key": previous["key"],
+  "latest_etag": previous["etag"],
+  "seeded_by": "jenkins_manual_latest_two",
+  "seeded_at_epoch": time.time(),
+}
+state_file.write_text(json.dumps(seed_state, indent=2), encoding="utf-8")
+print(f"[s3-poll] seeded state file for delta baseline: {state_file}", flush=True)
 
-print(f"{detected['key']}\t{detected['etag']}")
+print(f"{latest['key']}\t{latest['etag']}\t{previous['key']}\t{previous['etag']}")
 PY
 )"
 
               DETECTED_KEY="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f1)"
               DETECTED_ETAG="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f2)"
+        PREVIOUS_KEY="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f3)"
+        PREVIOUS_ETAG="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f4)"
 
               if [[ -z "$DETECTED_KEY" ]]; then
                 echo "ERROR: S3 polling gate did not capture a detected key" >&2
@@ -285,9 +264,11 @@ PY
               cat >> "$RUN_ROOT/run.env" <<EOF
 export DETECTED_S3_KEY="$DETECTED_KEY"
 export DETECTED_S3_ETAG="$DETECTED_ETAG"
+export PREVIOUS_S3_KEY="$PREVIOUS_KEY"
+export PREVIOUS_S3_ETAG="$PREVIOUS_ETAG"
 EOF
 
-              echo "Detected new S3 upload: key=$DETECTED_KEY etag=$DETECTED_ETAG"
+              echo "Using latest two S3 uploads: previous=$PREVIOUS_KEY latest=$DETECTED_KEY"
             '''
           }
         }
