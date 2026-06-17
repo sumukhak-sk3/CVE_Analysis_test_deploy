@@ -209,23 +209,23 @@ s3 = boto3.client("s3", region_name=region)
 
 def list_csvs_sorted():
     paginator = s3.get_paginator("list_objects_v2")
-    rows = []
+  rows = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj.get("Key") or ""
             if not key or key.endswith("/") or not key.lower().endswith(".csv"):
                 continue
-            rows.append({
-                "key": key,
-                "etag": (obj.get("ETag") or "").strip('"'),
-                "last_modified": float(obj["LastModified"].timestamp()),
-            })
-    rows.sort(key=lambda r: r["last_modified"])
-    return rows
+      rows.append({
+        "key": key,
+        "etag": (obj.get("ETag") or "").strip('"'),
+        "last_modified": float(obj["LastModified"].timestamp()),
+      })
+  rows.sort(key=lambda r: r["last_modified"])
+  return rows
 
 csvs = list_csvs_sorted()
 if len(csvs) < 2:
-    raise SystemExit(f"Need at least 2 CSV uploads in s3://{bucket}/{prefix} to compute delta (found {len(csvs)})")
+  raise SystemExit(f"Need at least 2 CSV uploads in s3://{bucket}/{prefix} to compute delta (found {len(csvs)})")
 
 previous = csvs[-2]
 latest = csvs[-1]
@@ -239,10 +239,10 @@ output_dir.mkdir(parents=True, exist_ok=True)
 state_file = (output_dir / state_file_name).resolve()
 
 seed_state = {
-    "latest_key": previous["key"],
-    "latest_etag": previous["etag"],
-    "seeded_by": "jenkins_manual_latest_two",
-    "seeded_at_epoch": time.time(),
+  "latest_key": previous["key"],
+  "latest_etag": previous["etag"],
+  "seeded_by": "jenkins_manual_latest_two",
+  "seeded_at_epoch": time.time(),
 }
 state_file.write_text(json.dumps(seed_state, indent=2), encoding="utf-8")
 print(f"[s3-poll] seeded state file for delta baseline: {state_file}", flush=True)
@@ -680,18 +680,16 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-          # Convert delta CSV to JSON (backend upload endpoint requires non-CSV extension).
-          VULNS_JSON="$RUN_DIR/delta_vulns.json"
+          VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
           DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
-import csv, json
+import csv
 from pathlib import Path
-rows = list(csv.DictReader(Path("${VULNERABILITIES_FILE_PATH_CLEAN}").open(encoding="utf-8-sig")))
-Path("$VULNS_JSON").write_text(json.dumps(rows, indent=2), encoding="utf-8")
+rows = list(csv.DictReader(Path("$VULNS_FILE").open(encoding="utf-8-sig")))
 print(len(rows))
 PY
 )"
 
-          echo "Converted delta CSV -> JSON: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
+          echo "Prepared delta CSV for upload: ${DELTA_ROW_COUNT} rows -> $VULNS_FILE"
 
           if [[ "${DELTA_ROW_COUNT}" == "0" ]]; then
             cat >> "$RUN_ROOT/run.env" <<EOF
@@ -707,11 +705,11 @@ EOF
             exit 0
           fi
 
-          # Upload converted JSON to backend so it can access it on its own filesystem.
+          # Upload delta CSV to backend so it can access it on its own filesystem.
           UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
           UPLOAD_HTTP="$(curl --silent --show-error \
             -X POST "$API_BASE/jenkins/upload-sbom" \
-            -F "sbom_file=@${VULNS_JSON};type=application/json" \
+            -F "sbom_file=@${VULNS_FILE};type=text/csv" \
             -o "$UPLOAD_BODY" \
             -w '%{http_code}')"
 
@@ -732,7 +730,7 @@ if stored:
     print(stored)
 else:
     ticket = (data.get("ticket") or "").strip()
-    filename = (data.get("filename") or "delta_vulns.json").strip()
+    filename = (data.get("filename") or "delta_vulns.csv").strip()
     if not ticket:
         raise SystemExit("ERROR: upload response missing both stored_path and ticket")
     # Backend default: .data/runs/jenkins/uploads/{ticket}/{filename}
