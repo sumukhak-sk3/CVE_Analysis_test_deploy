@@ -81,71 +81,34 @@ pipeline {
             echo "ERROR: REPOSITORY_URL is required" >&2
             exit 1
           fi
-          VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
-          VULNS_JSON="$RUN_DIR/delta_vulns.json"
-          DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
-import csv
-import json
-import re
-from pathlib import Path
 
-src = Path("$VULNS_FILE")
-rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
+          API_BASE="${API_BASE_URL_CLEAN%/}"
+          PROJECT_NAME="$(basename "${REPOSITORY_URL_CLEAN%.git}")"
+          RUN_DIR="$RUN_ROOT/run_$(date +%Y%m%d_%H%M%S)"
 
-def g(rec, *keys):
-    norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
-    for k in keys:
-        v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
-        if v not in (None, ""):
-            return str(v).strip()
-    return ""
+          if [[ "$OUTPUT_DIR" = /* ]]; then
+            OUTPUT_DIR_ABS="$OUTPUT_DIR"
+          else
+            OUTPUT_DIR_ABS="$WORKSPACE/$OUTPUT_DIR"
+          fi
 
-def fnum(v):
-    try:
-        return float(v) if v not in (None, "") else None
-    except Exception:
-        return None
+          mkdir -p "$RUN_DIR" "$OUTPUT_DIR_ABS"
 
-findings = []
-for rec in rows:
-    cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
-    if not cve_id:
-        continue
-    finding = {
-        "vulnerability": {
-            "vulnId": cve_id,
-            "severity": g(rec, "Severity") or "UNASSIGNED",
-            "description": g(rec, "Description"),
-            "source": g(rec, "Source") or "NVD",
-            "published": g(rec, "Published"),
-            "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
-            "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
-            "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
-            "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
-            "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
-            "references": None,
-        },
-        "component": {
-            "name": g(rec, "Component_Name", "ComponentName"),
-            "version": g(rec, "Component_Version", "ComponentVersion"),
-            "group": g(rec, "Component_Group", "ComponentGroup"),
-            "purl": g(rec, "purl", "PURL"),
-        },
-    }
-    findings.append(finding)
-
-payload = {
-    "findings": findings,
-    "project": {
-        "name": "$PROJECT_NAME",
-        "version": "$BRANCH_CLEAN",
-        "uuid": None,
-    },
-}
-Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-print(len(rows))
-PY
-)
+          RUN_ENV_FILE="$RUN_ROOT/run.env"
+          {
+            printf 'export RUN_ROOT=%q\n' "$RUN_ROOT"
+            printf 'export LOG_DIR=%q\n' "$LOG_DIR"
+            printf 'export RUN_DIR=%q\n' "$RUN_DIR"
+            printf 'export OUTPUT_DIR_ABS=%q\n' "$OUTPUT_DIR_ABS"
+            printf 'export API_BASE=%q\n' "$API_BASE"
+            printf 'export PROJECT_NAME=%q\n' "$PROJECT_NAME"
+            printf 'export REPOSITORY_URL_CLEAN=%q\n' "$REPOSITORY_URL_CLEAN"
+            printf 'export BRANCH_CLEAN=%q\n' "$BRANCH_CLEAN"
+            printf 'export VULNERABILITIES_FILE_PATH_CLEAN=%q\n' "$VULNERABILITIES_FILE_PATH_CLEAN"
+            printf 'export EXISTING_INDEX_ID_CLEAN=%q\n' "$EXISTING_INDEX_ID_CLEAN"
+            printf 'export AUTOMATION_CONFIG_PATH_CLEAN=%q\n' "$AUTOMATION_CONFIG_PATH_CLEAN"
+            printf 'export SKIP_ANALYSIS=%q\n' "0"
+          } > "$RUN_ENV_FILE"
 
           echo "RUN_DIR=$RUN_DIR"
           echo "OUTPUT_DIR_ABS=$OUTPUT_DIR_ABS"
