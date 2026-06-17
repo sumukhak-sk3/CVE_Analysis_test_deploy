@@ -318,136 +318,7 @@ EOF
                 echo "ERROR: vulnerabilities path resolution produced an empty value" >&2
                 exit 1
               fi
-              if [[ "$AUTO_VULNERABILITIES_FILE_PATH" != /* ]]; then
-                echo "ERROR: resolved vulnerabilities file path must be absolute: $AUTO_VULNERABILITIES_FILE_PATH" >&2
-                exit 1
-              fi
-
-              EXT_LOWER="$(echo "${AUTO_VULNERABILITIES_FILE_PATH##*.}" | tr '[:upper:]' '[:lower:]')"
-              case "$EXT_LOWER" in
-                json|csv|xlsx|xlsm) ;;
-                *)
-                  echo "ERROR: resolved vulnerabilities file extension is invalid: $AUTO_VULNERABILITIES_FILE_PATH" >&2
-                  exit 1
-                  ;;
-              esac
-
-              cat >> "$RUN_ROOT/run.env" <<EOF
-export REPOSITORY_URL_CLEAN="$AUTO_REPOSITORY_URL"
-export BRANCH_CLEAN="$AUTO_BRANCH"
-export VULNERABILITIES_FILE_PATH_CLEAN="$AUTO_VULNERABILITIES_FILE_PATH"
-export AUTO_BRANCH_SOURCE="$AUTO_BRANCH_SOURCE"
-export AUTO_VULNERABILITIES_FILE_PATH_SOURCE="$AUTO_VULNERABILITIES_FILE_PATH_SOURCE"
-EOF
-
-              echo "Resolved BRANCH=$AUTO_BRANCH (source=$AUTO_BRANCH_SOURCE)"
-              echo "Resolved VULNERABILITIES_FILE_PATH=$AUTO_VULNERABILITIES_FILE_PATH (source=$AUTO_VULNERABILITIES_FILE_PATH_SOURCE)"
-            '''
-          }
-        }
-      }
-    }
-
-    stage('Check API Health') {
-      options { timeout(time: 5, unit: 'MINUTES') }
-      steps {
-        sh '''#!/usr/bin/env bash
-          set -euo pipefail
-          source "$RUN_ROOT/run.env"
-          curl --fail --silent --show-error "$API_BASE/health" \
-            | tee "$LOG_DIR/api_health.json" >/dev/null
-          echo "Backend health endpoint reachable: $API_BASE/health"
-        '''
-      }
-    }
-
-    stage('Build Code Index (API)') {
-      options { timeout(time: 240, unit: 'MINUTES') }
-      steps {
-        sh '''#!/usr/bin/env bash
-          set -euo pipefail
-          source "$RUN_ROOT/run.env"
-
-          curl --fail --silent --show-error "$API_BASE/indexes" -o "$RUN_DIR/indexes.json"
-
-            # Reuse an existing VM index when possible: explicit id takes priority.
-            # If explicit id is not found, fall back to project+branch matching.
-          IDX_SELECT="$($PYTHON_BIN - <<PY
-import json
-import re
-import sys
-from pathlib import Path
-
-target = "${EXISTING_INDEX_ID_CLEAN}".strip()
-project = "${PROJECT_NAME}".strip()
-branch = "${BRANCH_CLEAN}".strip()
-repo_url = "${REPOSITORY_URL_CLEAN}".strip()
-data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
-indexes = data.get("indexes") or []
-
-picked = None
-reason = ""
-
-def norm(s: str) -> str:
-  return re.sub(r"[^A-Za-z0-9._-]+", "-", (s or "")).strip("-").lower()
-
-def idx_id(item: dict) -> str:
-  return (item.get("id") or item.get("index_id") or "").strip()
-
-def norm_git(u: str) -> str:
-  s = (u or "").strip().lower()
-  if not s:
-    return ""
-  s = re.sub(r"^(ssh://)", "", s)
-  m = re.match(r"^(?:[^@]+@)?([^:/]+)[:/](.+)$", s)
-  if m:
-    host = m.group(1)
-    path = m.group(2)
-  else:
-    m = re.match(r"^https?://([^/]+)/(.+)$", s)
-    if m:
-      host = m.group(1)
-      path = m.group(2)
-    else:
-      return s[:-4] if s.endswith(".git") else s
-  path = path.strip("/")
-  if path.endswith(".git"):
-    path = path[:-4]
-  return f"{host}/{path}"
-
-target_norm = norm(target)
-project_norm = norm(project)
-branch_norm = norm(branch)
-
-if target:
-  picked = next((i for i in indexes if idx_id(i) == target), None)
-  if picked is None and target_norm:
-    picked = next((i for i in indexes if norm(idx_id(i)) == target_norm), None)
-  if picked is None:
-    print(f"WARNING: Requested EXISTING_INDEX_ID not found on backend VM: {target}", file=sys.stderr)
-    print("Known indexes from /indexes:", file=sys.stderr)
-    for i in indexes:
-      print(f"  - {idx_id(i)}", file=sys.stderr)
-    reason = "provided_missing"
-  else:
-    reason = "provided"
-
-if picked is None:
-  # Primary auto-match: exact project+branch metadata.
-  repo_norm = norm_git(repo_url)
-  def repo_match(i: dict) -> bool:
     g = norm_git(i.get("git_url") or "")
-    return (not repo_norm) or (g == repo_norm)
-
-  matches = [
-    i for i in indexes
-    if (
-      ((i.get("project") or project) == project) and
-      ((i.get("branch") or "") == branch) and
-      repo_match(i)
-    )
-  ]
-  if not matches:
     # Fallback: normalized metadata match for branch naming differences.
     matches = [
       i for i in indexes
@@ -458,73 +329,88 @@ if picked is None:
       )
     ]
   if not matches and project_norm and branch_norm:
-    # Final fallback: infer from index id pattern when branch metadata is absent/inconsistent.
-    matches = [
-      i for i in indexes
-      if (
-        norm(idx_id(i)).startswith(f"{project_norm}__") and
-        branch_norm in norm(idx_id(i)) and
-        repo_match(i)
-      )
-    ]
-  if matches:
-    matches.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
-    picked = matches[0]
-    reason = "auto"
-
-# Same-repo fallback: if no exact branch match, reuse the most recent index for
-# the same repository rather than triggering a new (potentially failing) build.
-if picked is None and repo_norm:
-  same_repo = [i for i in indexes if repo_match(i) and idx_id(i)]
-  if same_repo:
-    same_repo.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
-    picked = same_repo[0]
-    reason = "same_repo_fallback"
-    print(f"WARNING: no index for branch={branch!r}; reusing nearest same-repo index: {idx_id(picked)!r} (branch={picked.get('branch')!r})", file=sys.stderr)
-
-if picked:
-  print("true")
-  print(idx_id(picked))
-  print(picked.get("repo_root") or "")
-  print(reason)
-else:
-  print("false")
-  print("")
-  print("")
-  print("none")
-  print(f"DEBUG: no index matched and no same-repo fallback available. project={project!r} branch={branch!r} repo_norm={repo_norm!r}", file=sys.stderr)
-  print("DEBUG: known indexes on backend VM:", file=sys.stderr)
-  for i in indexes:
-    print(f"  id={idx_id(i)!r} project={i.get('project')!r} branch={i.get('branch')!r} git_url_norm={norm_git(i.get('git_url') or '')!r}", file=sys.stderr)
-PY
-)"
-
-          REUSE_EXISTING="$(printf '%s\n' "$IDX_SELECT" | sed -n '1p')"
-          INDEX_ID="$(printf '%s\n' "$IDX_SELECT" | sed -n '2p')"
-          REPO_ROOT="$(printf '%s\n' "$IDX_SELECT" | sed -n '3p')"
-          REUSE_REASON="$(printf '%s\n' "$IDX_SELECT" | sed -n '4p')"
-
-            if [[ "$REUSE_EXISTING" == "true" ]]; then
-            if [[ -z "$INDEX_ID" ]]; then
-              echo "ERROR: existing index selection returned empty index id" >&2
-              exit 1
-            fi
-            cat >> "$RUN_ROOT/run.env" <<EOF
-export INDEX_ID="$INDEX_ID"
 export REPO_ROOT="$REPO_ROOT"
-EOF
+          VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
+          VULNS_JSON="$RUN_DIR/delta_vulns.json"
+          DELTA_ROW_COUNT="$($PYTHON_BIN - "$VULNS_FILE" "$VULNS_JSON" "$PROJECT_NAME" "$BRANCH_CLEAN" <<'PY'
+import csv
+import json
+import re
+import sys
+from pathlib import Path
 
-            if [[ "$REUSE_REASON" == "provided" ]]; then
-              echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
-              echo "Skipping /index/build because EXISTING_INDEX_ID was provided."
-            else
-              echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
-              echo "Skipping /index/build because project+branch index already exists."
-            fi
-            echo "REPO_ROOT=$REPO_ROOT"
-            exit 0
-          fi
+csv_path = Path(sys.argv[1]).resolve()
+json_out = Path(sys.argv[2]).resolve()
+project_name = sys.argv[3]
+project_version = sys.argv[4]
 
+def _get(record, *keys):
+    normalized = {re.sub(r"[\s_]+", "", str(key)).lower(): value for key, value in record.items()}
+    for key in keys:
+        value = normalized.get(re.sub(r"[\s_]+", "", key).lower())
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+def _float_or_none(value):
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+if not csv_path.exists():
+    raise SystemExit(f"CSV file not found: {csv_path}")
+
+with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+
+findings = []
+for record in rows:
+    cve_id = _get(record, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
+    if not cve_id:
+        continue
+    findings.append(
+        {
+            "vulnerability": {
+                "vulnId": cve_id,
+                "severity": _get(record, "Severity") or "UNASSIGNED",
+                "description": _get(record, "Description"),
+                "source": _get(record, "Source") or "NVD",
+                "published": _get(record, "Published"),
+                "cwes": [
+                    cve.strip()
+                    for cve in re.split(r"[,;|]", _get(record, "CWE_IDs", "CWE"))
+                    if cve.strip()
+                ],
+                "cvssV3": _float_or_none(_get(record, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
+                "cvssV2": _float_or_none(_get(record, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
+                "epssScore": _float_or_none(_get(record, "EPSS_Score", "epss")),
+                "epssPercentile": _float_or_none(_get(record, "EPSS_Percentile", "epssPercentile")),
+                "references": None,
+            },
+            "component": {
+                "name": _get(record, "Component_Name", "ComponentName"),
+                "version": _get(record, "Component_Version", "ComponentVersion"),
+                "group": _get(record, "Component_Group", "ComponentGroup"),
+                "purl": _get(record, "purl", "PURL"),
+            },
+        }
+    )
+
+payload = {
+    "findings": findings,
+    "project": {
+        "name": project_name,
+        "version": project_version or None,
+        "uuid": None,
+    },
+}
+json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+print(len(rows))
+PY
+)
+
+          echo "Prepared delta payload for upload: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
           INDEX_BUILD_PAYLOAD="$RUN_DIR/index_build_payload.json"
           "$PYTHON_BIN" - <<PY
 import json
@@ -804,7 +690,7 @@ PY
 import json
 severities = [s.strip() for s in "${SEVERITIES}".split(",") if s.strip()]
 payload = {
-  "vulns_path": "${SERVER_VULNS_PATH}",
+    "vulns_path": "${SERVER_VULNS_PATH}",
     "severities": severities or ["CRITICAL", "HIGH"],
     "limit": int("${LIMIT}"),
     "mode": "${ANALYSIS_MODE}",
