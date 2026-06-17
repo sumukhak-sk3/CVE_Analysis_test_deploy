@@ -680,16 +680,73 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-          VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
+            VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
+            VULNS_JSON="$RUN_DIR/delta_vulns.json"
           DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
 import csv
+      import json
+      import re
 from pathlib import Path
-rows = list(csv.DictReader(Path("$VULNS_FILE").open(encoding="utf-8-sig")))
+
+      src = Path("$VULNS_FILE")
+      rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
+
+      def g(rec, *keys):
+        norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
+        for k in keys:
+          v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
+          if v not in (None, ""):
+            return str(v).strip()
+        return ""
+
+      def fnum(v):
+        try:
+          return float(v) if v not in (None, "") else None
+        except Exception:
+          return None
+
+      findings = []
+      for rec in rows:
+        cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
+        if not cve_id:
+          continue
+        finding = {
+          "vulnerability": {
+            "vulnId": cve_id,
+            "severity": g(rec, "Severity") or "UNASSIGNED",
+            "description": g(rec, "Description"),
+            "source": g(rec, "Source") or "NVD",
+            "published": g(rec, "Published"),
+            "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
+            "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
+            "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
+            "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
+            "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
+            "references": None,
+          },
+          "component": {
+            "name": g(rec, "Component_Name", "ComponentName"),
+            "version": g(rec, "Component_Version", "ComponentVersion"),
+            "group": g(rec, "Component_Group", "ComponentGroup"),
+            "purl": g(rec, "purl", "PURL"),
+          },
+        }
+        findings.append(finding)
+
+      payload = {
+        "findings": findings,
+        "project": {
+          "name": "$PROJECT_NAME",
+          "version": "$BRANCH_CLEAN",
+          "uuid": None,
+        },
+      }
+      Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 print(len(rows))
 PY
 )"
 
-          echo "Prepared delta CSV for upload: ${DELTA_ROW_COUNT} rows -> $VULNS_FILE"
+            echo "Prepared delta payload for upload: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
 
           if [[ "${DELTA_ROW_COUNT}" == "0" ]]; then
             cat >> "$RUN_ROOT/run.env" <<EOF
@@ -705,14 +762,13 @@ EOF
             exit 0
           fi
 
-          # Upload delta CSV to backend so it can access it on its own filesystem.
-          UPLOAD_FILE="$RUN_DIR/delta_vulns.csv"
-          cp "$VULNS_FILE" "$UPLOAD_FILE"
+          # Upload delta JSON to backend so it can access it on its own filesystem.
+          UPLOAD_FILE="$VULNS_JSON"
 
           UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
           UPLOAD_HTTP="$(curl --silent --show-error \
             -X POST "$API_BASE/jenkins/upload-sbom" \
-            -F "sbom_file=@${UPLOAD_FILE};filename=delta_vulns.csv;type=text/csv" \
+            -F "sbom_file=@${UPLOAD_FILE};filename=delta_vulns.json;type=application/json" \
             -o "$UPLOAD_BODY" \
             -w '%{http_code}')"
 
@@ -733,7 +789,7 @@ if stored:
     print(stored)
 else:
     ticket = (data.get("ticket") or "").strip()
-    filename = (data.get("filename") or "delta_vulns.csv").strip()
+    filename = (data.get("filename") or "delta_vulns.json").strip()
     if not ticket:
         raise SystemExit("ERROR: upload response missing both stored_path and ticket")
     # Backend default: .data/runs/jenkins/uploads/{ticket}/{filename}
