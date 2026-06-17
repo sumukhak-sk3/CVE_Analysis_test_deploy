@@ -81,71 +81,71 @@ pipeline {
             echo "ERROR: REPOSITORY_URL is required" >&2
             exit 1
           fi
-          if [[ -n "$VULNERABILITIES_FILE_PATH_CLEAN" ]]; then
-            if [[ "$VULNERABILITIES_FILE_PATH_CLEAN" != /* ]]; then
-              echo "ERROR: VULNERABILITIES_FILE_PATH must be an absolute path when manually supplied" >&2
-              exit 1
-            fi
-            EXT_LOWER="$(echo "${VULNERABILITIES_FILE_PATH_CLEAN##*.}" | tr '[:upper:]' '[:lower:]')"
-            case "$EXT_LOWER" in
-              json|csv|xlsx|xlsm) ;;
-              *)
-                echo "ERROR: VULNERABILITIES_FILE_PATH extension must be .json/.csv/.xlsx/.xlsm (got: $VULNERABILITIES_FILE_PATH_CLEAN)" >&2
-                exit 1
-                ;;
-            esac
-          fi
+          VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
+          VULNS_JSON="$RUN_DIR/delta_vulns.json"
+          DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
+import csv
+import json
+import re
+from pathlib import Path
 
-          if [[ -z "$API_BASE_URL_CLEAN" ]]; then
-            echo "ERROR: API_BASE_URL is required" >&2
-            exit 1
-          fi
-          if [[ ! "$API_BASE_URL_CLEAN" =~ ^https?:// ]]; then
-            echo "ERROR: API_BASE_URL must start with http:// or https://" >&2
-            exit 1
-          fi
+src = Path("$VULNS_FILE")
+rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
 
-          if [[ ! "${LIMIT:-}" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: LIMIT must be a non-negative integer" >&2
-            exit 1
-          fi
+def g(rec, *keys):
+    norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
+    for k in keys:
+        v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
 
-          if [[ ! "${WORKERS:-}" =~ ^[0-9]+$ || "${WORKERS:-}" -le 0 ]]; then
-            echo "ERROR: WORKERS must be a positive integer" >&2
-            exit 1
-          fi
+def fnum(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except Exception:
+        return None
 
-          RUN_DIR="$RUN_ROOT/run-${BUILD_NUMBER}"
-          API_BASE="${API_BASE_URL_CLEAN%/}"
-          PROJECT_NAME="$(basename "$REPOSITORY_URL_CLEAN")"
-          PROJECT_NAME="${PROJECT_NAME%.git}"
-          PROJECT_NAME="$(printf '%s' "$PROJECT_NAME" | tr -cs 'A-Za-z0-9._-' '-')"
-          PROJECT_NAME="${PROJECT_NAME#-}"
-          PROJECT_NAME="${PROJECT_NAME%-}"
+findings = []
+for rec in rows:
+    cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
+    if not cve_id:
+        continue
+    finding = {
+        "vulnerability": {
+            "vulnId": cve_id,
+            "severity": g(rec, "Severity") or "UNASSIGNED",
+            "description": g(rec, "Description"),
+            "source": g(rec, "Source") or "NVD",
+            "published": g(rec, "Published"),
+            "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
+            "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
+            "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
+            "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
+            "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
+            "references": None,
+        },
+        "component": {
+            "name": g(rec, "Component_Name", "ComponentName"),
+            "version": g(rec, "Component_Version", "ComponentVersion"),
+            "group": g(rec, "Component_Group", "ComponentGroup"),
+            "purl": g(rec, "purl", "PURL"),
+        },
+    }
+    findings.append(finding)
 
-          if [[ -n "${OUTPUT_DIR:-}" ]]; then
-            if [[ "${OUTPUT_DIR}" = /* ]]; then
-              OUTPUT_DIR_ABS="$OUTPUT_DIR"
-            else
-              OUTPUT_DIR_ABS="$WORKSPACE/$OUTPUT_DIR"
-            fi
-          else
-            OUTPUT_DIR_ABS="$RUN_DIR/output"
-          fi
-
-          mkdir -p "$RUN_DIR" "$OUTPUT_DIR_ABS" "$LOG_DIR"
-
-          cat > "$RUN_ROOT/run.env" <<EOF
-export RUN_DIR="$RUN_DIR"
-export OUTPUT_DIR_ABS="$OUTPUT_DIR_ABS"
-export API_BASE="$API_BASE"
-export PROJECT_NAME="$PROJECT_NAME"
-export REPOSITORY_URL_CLEAN="$REPOSITORY_URL_CLEAN"
-export BRANCH_CLEAN="$BRANCH_CLEAN"
-export VULNERABILITIES_FILE_PATH_CLEAN="$VULNERABILITIES_FILE_PATH_CLEAN"
-export EXISTING_INDEX_ID_CLEAN="$EXISTING_INDEX_ID_CLEAN"
-export AUTOMATION_CONFIG_PATH_CLEAN="$AUTOMATION_CONFIG_PATH_CLEAN"
-EOF
+payload = {
+    "findings": findings,
+    "project": {
+        "name": "$PROJECT_NAME",
+        "version": "$BRANCH_CLEAN",
+        "uuid": None,
+    },
+}
+Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+print(len(rows))
+PY
+)
 
           echo "RUN_DIR=$RUN_DIR"
           echo "OUTPUT_DIR_ABS=$OUTPUT_DIR_ABS"
@@ -683,66 +683,66 @@ EOF
             VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
             VULNS_JSON="$RUN_DIR/delta_vulns.json"
           DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
-        import csv
-        import json
-        import re
-        from pathlib import Path
+import csv
+import json
+import re
+from pathlib import Path
 
-        src = Path("$VULNS_FILE")
-        rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
+src = Path("$VULNS_FILE")
+rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
 
-        def g(rec, *keys):
-          norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
-          for k in keys:
-            v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
-            if v not in (None, ""):
-              return str(v).strip()
-          return ""
+def g(rec, *keys):
+    norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
+    for k in keys:
+        v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
+        if v not in (None, ""):
+            return str(v).strip()
+    return ""
 
-        def fnum(v):
-          try:
-            return float(v) if v not in (None, "") else None
-          except Exception:
-            return None
+def fnum(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except Exception:
+        return None
 
-        findings = []
-        for rec in rows:
-          cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
-          if not cve_id:
-            continue
-          finding = {
-            "vulnerability": {
-              "vulnId": cve_id,
-              "severity": g(rec, "Severity") or "UNASSIGNED",
-              "description": g(rec, "Description"),
-              "source": g(rec, "Source") or "NVD",
-              "published": g(rec, "Published"),
-              "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
-              "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
-              "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
-              "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
-              "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
-              "references": None,
-            },
-            "component": {
-              "name": g(rec, "Component_Name", "ComponentName"),
-              "version": g(rec, "Component_Version", "ComponentVersion"),
-              "group": g(rec, "Component_Group", "ComponentGroup"),
-              "purl": g(rec, "purl", "PURL"),
-            },
-          }
-          findings.append(finding)
+findings = []
+for rec in rows:
+    cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
+    if not cve_id:
+        continue
+    finding = {
+        "vulnerability": {
+            "vulnId": cve_id,
+            "severity": g(rec, "Severity") or "UNASSIGNED",
+            "description": g(rec, "Description"),
+            "source": g(rec, "Source") or "NVD",
+            "published": g(rec, "Published"),
+            "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
+            "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
+            "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
+            "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
+            "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
+            "references": None,
+        },
+        "component": {
+            "name": g(rec, "Component_Name", "ComponentName"),
+            "version": g(rec, "Component_Version", "ComponentVersion"),
+            "group": g(rec, "Component_Group", "ComponentGroup"),
+            "purl": g(rec, "purl", "PURL"),
+        },
+    }
+    findings.append(finding)
 
-        payload = {
-          "findings": findings,
-          "project": {
-            "name": "$PROJECT_NAME",
-            "version": "$BRANCH_CLEAN",
-            "uuid": None,
-          },
-        }
-        Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(len(rows))
+payload = {
+    "findings": findings,
+    "project": {
+        "name": "$PROJECT_NAME",
+        "version": "$BRANCH_CLEAN",
+        "uuid": None,
+    },
+}
+Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+print(len(rows))
 PY
 )"
 
