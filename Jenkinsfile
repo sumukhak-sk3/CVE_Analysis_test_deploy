@@ -281,18 +281,15 @@ EOF
                 echo "ERROR: vulnerabilities path resolution produced an empty value" >&2
                 exit 1
               fi
-    g = norm_git(i.get("git_url") or "")
-    # Fallback: normalized metadata match for branch naming differences.
-    matches = [
-      i for i in indexes
-      if (
-        (norm(i.get("project") or project) == project_norm) and
-        (norm(i.get("branch") or "") == branch_norm) and
-        repo_match(i)
-      )
-    ]
-  if not matches and project_norm and branch_norm:
-export REPO_ROOT="$REPO_ROOT"
+
+              BRANCH_CLEAN="$AUTO_BRANCH"
+              VULNERABILITIES_FILE_PATH_CLEAN="$AUTO_VULNERABILITIES_FILE_PATH"
+
+              cat >> "$RUN_ROOT/run.env" <<EOF
+export BRANCH_CLEAN="$BRANCH_CLEAN"
+export VULNERABILITIES_FILE_PATH_CLEAN="$VULNERABILITIES_FILE_PATH_CLEAN"
+EOF
+
           VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
           VULNS_JSON="$RUN_DIR/delta_vulns.json"
           DELTA_ROW_COUNT="$($PYTHON_BIN - "$VULNS_FILE" "$VULNS_JSON" "$PROJECT_NAME" "$BRANCH_CLEAN" <<'PY'
