@@ -345,9 +345,9 @@ project_name = sys.argv[3]
 project_version = sys.argv[4]
 
 def _get(record, *keys):
-    normalized = {re.sub(r"[\s_]+", "", str(key)).lower(): value for key, value in record.items()}
+    normalized = {re.sub(r"[\\s_]+", "", str(key)).lower(): value for key, value in record.items()}
     for key in keys:
-        value = normalized.get(re.sub(r"[\s_]+", "", key).lower())
+        value = normalized.get(re.sub(r"[\\s_]+", "", key).lower())
         if value not in (None, ""):
             return str(value).strip()
     return ""
