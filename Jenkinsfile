@@ -558,6 +558,8 @@ EOF
         '''
       }
     }
+      }
+    }
 
     stage('Run Vulnerability Analysis (API)') {
       options { timeout(time: 240, unit: 'MINUTES') }
