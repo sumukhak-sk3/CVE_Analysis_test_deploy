@@ -7,7 +7,7 @@ pipeline {
     timestamps()
     disableConcurrentBuilds()
     skipDefaultCheckout(true)
-    timeout(time: 120, unit: 'MINUTES')
+    timeout(time: 600, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
@@ -81,34 +81,71 @@ pipeline {
             echo "ERROR: REPOSITORY_URL is required" >&2
             exit 1
           fi
-
-          API_BASE="${API_BASE_URL_CLEAN%/}"
-          PROJECT_NAME="$(basename "${REPOSITORY_URL_CLEAN%.git}")"
-          RUN_DIR="$RUN_ROOT/run_$(date +%Y%m%d_%H%M%S)"
-
-          if [[ "$OUTPUT_DIR" = /* ]]; then
-            OUTPUT_DIR_ABS="$OUTPUT_DIR"
-          else
-            OUTPUT_DIR_ABS="$WORKSPACE/$OUTPUT_DIR"
+          if [[ -n "$VULNERABILITIES_FILE_PATH_CLEAN" ]]; then
+            if [[ "$VULNERABILITIES_FILE_PATH_CLEAN" != /* ]]; then
+              echo "ERROR: VULNERABILITIES_FILE_PATH must be an absolute path when manually supplied" >&2
+              exit 1
+            fi
+            EXT_LOWER="$(echo "${VULNERABILITIES_FILE_PATH_CLEAN##*.}" | tr '[:upper:]' '[:lower:]')"
+            case "$EXT_LOWER" in
+              json|csv|xlsx|xlsm) ;;
+              *)
+                echo "ERROR: VULNERABILITIES_FILE_PATH extension must be .json/.csv/.xlsx/.xlsm (got: $VULNERABILITIES_FILE_PATH_CLEAN)" >&2
+                exit 1
+                ;;
+            esac
           fi
 
-          mkdir -p "$RUN_DIR" "$OUTPUT_DIR_ABS"
+          if [[ -z "$API_BASE_URL_CLEAN" ]]; then
+            echo "ERROR: API_BASE_URL is required" >&2
+            exit 1
+          fi
+          if [[ ! "$API_BASE_URL_CLEAN" =~ ^https?:// ]]; then
+            echo "ERROR: API_BASE_URL must start with http:// or https://" >&2
+            exit 1
+          fi
 
-          RUN_ENV_FILE="$RUN_ROOT/run.env"
-          {
-            printf 'export RUN_ROOT=%q\n' "$RUN_ROOT"
-            printf 'export LOG_DIR=%q\n' "$LOG_DIR"
-            printf 'export RUN_DIR=%q\n' "$RUN_DIR"
-            printf 'export OUTPUT_DIR_ABS=%q\n' "$OUTPUT_DIR_ABS"
-            printf 'export API_BASE=%q\n' "$API_BASE"
-            printf 'export PROJECT_NAME=%q\n' "$PROJECT_NAME"
-            printf 'export REPOSITORY_URL_CLEAN=%q\n' "$REPOSITORY_URL_CLEAN"
-            printf 'export BRANCH_CLEAN=%q\n' "$BRANCH_CLEAN"
-            printf 'export VULNERABILITIES_FILE_PATH_CLEAN=%q\n' "$VULNERABILITIES_FILE_PATH_CLEAN"
-            printf 'export EXISTING_INDEX_ID_CLEAN=%q\n' "$EXISTING_INDEX_ID_CLEAN"
-            printf 'export AUTOMATION_CONFIG_PATH_CLEAN=%q\n' "$AUTOMATION_CONFIG_PATH_CLEAN"
-            printf 'export SKIP_ANALYSIS=%q\n' "0"
-          } > "$RUN_ENV_FILE"
+          if [[ ! "${LIMIT:-}" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: LIMIT must be a non-negative integer" >&2
+            exit 1
+          fi
+
+          if [[ ! "${WORKERS:-}" =~ ^[0-9]+$ || "${WORKERS:-}" -le 0 ]]; then
+            echo "ERROR: WORKERS must be a positive integer" >&2
+            exit 1
+          fi
+
+          RUN_DIR="$RUN_ROOT/run-${BUILD_NUMBER}"
+          API_BASE="${API_BASE_URL_CLEAN%/}"
+          PROJECT_NAME="$(basename "$REPOSITORY_URL_CLEAN")"
+          PROJECT_NAME="${PROJECT_NAME%.git}"
+          PROJECT_NAME="$(printf '%s' "$PROJECT_NAME" | tr -cs 'A-Za-z0-9._-' '-')"
+          PROJECT_NAME="${PROJECT_NAME#-}"
+          PROJECT_NAME="${PROJECT_NAME%-}"
+
+          if [[ -n "${OUTPUT_DIR:-}" ]]; then
+            if [[ "${OUTPUT_DIR}" = /* ]]; then
+              OUTPUT_DIR_ABS="$OUTPUT_DIR"
+            else
+              OUTPUT_DIR_ABS="$WORKSPACE/$OUTPUT_DIR"
+            fi
+          else
+            OUTPUT_DIR_ABS="$RUN_DIR/output"
+          fi
+
+          mkdir -p "$RUN_DIR" "$OUTPUT_DIR_ABS" "$LOG_DIR"
+
+          cat > "$RUN_ROOT/run.env" <<EOF
+export RUN_DIR="$RUN_DIR"
+export OUTPUT_DIR_ABS="$OUTPUT_DIR_ABS"
+export API_BASE="$API_BASE"
+export PROJECT_NAME="$PROJECT_NAME"
+export REPOSITORY_URL_CLEAN="$REPOSITORY_URL_CLEAN"
+export BRANCH_CLEAN="$BRANCH_CLEAN"
+export VULNERABILITIES_FILE_PATH_CLEAN="$VULNERABILITIES_FILE_PATH_CLEAN"
+export EXISTING_INDEX_ID_CLEAN="$EXISTING_INDEX_ID_CLEAN"
+export AUTOMATION_CONFIG_PATH_CLEAN="$AUTOMATION_CONFIG_PATH_CLEAN"
+EOF
 
           echo "RUN_DIR=$RUN_DIR"
           echo "OUTPUT_DIR_ABS=$OUTPUT_DIR_ABS"
@@ -123,7 +160,7 @@ pipeline {
     }
 
     stage('Wait for New S3 Upload') {
-      options { timeout(time: 120, unit: 'MINUTES') }
+      options { timeout(time: 20, unit: 'MINUTES') }
       steps {
         script {
           withCredentials([
@@ -135,6 +172,16 @@ pipeline {
 
               if [[ -n "$VULNERABILITIES_FILE_PATH_CLEAN" ]]; then
                 echo "Manual VULNERABILITIES_FILE_PATH provided. Skipping S3 polling gate."
+                exit 0
+              fi
+
+              TRIGGER_MODE="manual"
+              if [[ -n "${UPSTREAM_PROJECT:-}" ]]; then
+                TRIGGER_MODE="upstream"
+              fi
+
+              if [[ "$TRIGGER_MODE" == "manual" ]]; then
+                echo "Manual trigger detected. Skipping S3 polling gate and continuing with latest-2 S3 resolution."
                 exit 0
               fi
 
@@ -165,59 +212,77 @@ if not bucket:
 
 prefix = (s3_cfg.get("prefix") or "").strip()
 region = (s3_cfg.get("aws_region") or "us-west-1").strip() or "us-west-1"
-delta_subdir = (s3_cfg.get("delta_output_subdir") or "s3_delta").strip() or "s3_delta"
-state_file_name = (s3_cfg.get("state_file_name") or ".last_processed_s3_file.json").strip() or ".last_processed_s3_file.json"
+poll_timeout = 900
+poll_interval = int(s3_cfg.get("poll_interval_seconds", 30))
+
+if poll_timeout <= 0:
+    raise SystemExit("s3.poll_timeout_seconds must be > 0")
+if poll_interval <= 0:
+    raise SystemExit("s3.poll_interval_seconds must be > 0")
 
 s3 = boto3.client("s3", region_name=region)
 
-def list_csvs_sorted():
+def list_csvs_desc():
     paginator = s3.get_paginator("list_objects_v2")
-    rows = []
+    objs = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj.get("Key") or ""
             if not key or key.endswith("/") or not key.lower().endswith(".csv"):
                 continue
-            rows.append({
-                "key": key,
-                "etag": (obj.get("ETag") or "").strip('"'),
-                "last_modified": float(obj["LastModified"].timestamp()),
-            })
-    rows.sort(key=lambda r: r["last_modified"])
-    return rows
+            objs.append(
+                {
+                    "key": key,
+                    "etag": (obj.get("ETag") or "").strip('"'),
+                    "last_modified": float(obj["LastModified"].timestamp()),
+                }
+            )
+    objs.sort(key=lambda x: x["last_modified"], reverse=True)
+    return objs
 
-csvs = list_csvs_sorted()
-if len(csvs) < 2:
-    raise SystemExit(f"Need at least 2 CSV uploads in s3://{bucket}/{prefix} to compute delta (found {len(csvs)})")
+baseline_list = list_csvs_desc()
+baseline = baseline_list[0] if baseline_list else None
+if baseline:
+    print(f"[s3-poll] baseline key={baseline['key']} etag={baseline['etag']} last_modified={baseline['last_modified']}", flush=True)
+else:
+    print("[s3-poll] baseline is empty (no CSV files yet)", flush=True)
 
-previous = csvs[-2]
-latest = csvs[-1]
+print(f"[s3-poll] upstream trigger detected; polling for up to {poll_timeout}s for a new upload", flush=True)
 
-print(f"[s3-poll] using previous key={previous['key']} etag={previous['etag']}", flush=True)
-print(f"[s3-poll] using latest key={latest['key']} etag={latest['etag']}", flush=True)
+deadline = time.time() + poll_timeout
+attempt = 0
+detected = None
+while time.time() < deadline:
+    attempt += 1
+    current_list = list_csvs_desc()
+    current = current_list[0] if current_list else None
+    if current is not None:
+        if baseline is None:
+            detected = current
+            print(f"[s3-poll] attempt={attempt} new file detected key={current['key']}", flush=True)
+            break
+        if (
+            (current["key"] != baseline["key"] or current["etag"] != baseline["etag"]) and
+            current["last_modified"] >= baseline["last_modified"]
+        ):
+            detected = current
+            print(f"[s3-poll] attempt={attempt} new file detected key={current['key']}", flush=True)
+            break
 
-run_root = Path("${RUN_ROOT}")
-output_dir = (run_root / delta_subdir).resolve()
-output_dir.mkdir(parents=True, exist_ok=True)
-state_file = (output_dir / state_file_name).resolve()
+    remaining = int(max(deadline - time.time(), 0))
+    current_key = (current or {}).get("key", "<none>")
+    print(f"[s3-poll] attempt={attempt} waiting... latest={current_key} remaining={remaining}s", flush=True)
+    time.sleep(poll_interval)
 
-seed_state = {
-    "latest_key": previous["key"],
-    "latest_etag": previous["etag"],
-    "seeded_by": "jenkins_manual_latest_two",
-    "seeded_at_epoch": time.time(),
-}
-state_file.write_text(json.dumps(seed_state, indent=2), encoding="utf-8")
-print(f"[s3-poll] seeded state file for delta baseline: {state_file}", flush=True)
+if detected is None:
+    raise SystemExit(f"Timed out after {poll_timeout}s waiting for new S3 CSV upload in s3://{bucket}/{prefix}")
 
-print(f"{latest['key']}\t{latest['etag']}\t{previous['key']}\t{previous['etag']}")
+print(f"{detected['key']}\t{detected['etag']}")
 PY
 )"
 
               DETECTED_KEY="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f1)"
               DETECTED_ETAG="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f2)"
-                PREVIOUS_KEY="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f3)"
-                PREVIOUS_ETAG="$(printf '%s\n' "$DETECTED_INFO" | tail -n 1 | cut -f4)"
 
               if [[ -z "$DETECTED_KEY" ]]; then
                 echo "ERROR: S3 polling gate did not capture a detected key" >&2
@@ -227,11 +292,9 @@ PY
               cat >> "$RUN_ROOT/run.env" <<EOF
 export DETECTED_S3_KEY="$DETECTED_KEY"
 export DETECTED_S3_ETAG="$DETECTED_ETAG"
-export PREVIOUS_S3_KEY="$PREVIOUS_KEY"
-export PREVIOUS_S3_ETAG="$PREVIOUS_ETAG"
 EOF
 
-              echo "Using latest two S3 uploads: previous=$PREVIOUS_KEY latest=$DETECTED_KEY"
+              echo "Detected new S3 upload: key=$DETECTED_KEY etag=$DETECTED_ETAG"
             '''
           }
         }
@@ -281,96 +344,213 @@ EOF
                 echo "ERROR: vulnerabilities path resolution produced an empty value" >&2
                 exit 1
               fi
+              if [[ "$AUTO_VULNERABILITIES_FILE_PATH" != /* ]]; then
+                echo "ERROR: resolved vulnerabilities file path must be absolute: $AUTO_VULNERABILITIES_FILE_PATH" >&2
+                exit 1
+              fi
 
-              BRANCH_CLEAN="$AUTO_BRANCH"
-              VULNERABILITIES_FILE_PATH_CLEAN="$AUTO_VULNERABILITIES_FILE_PATH"
+              EXT_LOWER="$(echo "${AUTO_VULNERABILITIES_FILE_PATH##*.}" | tr '[:upper:]' '[:lower:]')"
+              case "$EXT_LOWER" in
+                json|csv|xlsx|xlsm) ;;
+                *)
+                  echo "ERROR: resolved vulnerabilities file extension is invalid: $AUTO_VULNERABILITIES_FILE_PATH" >&2
+                  exit 1
+                  ;;
+              esac
 
               cat >> "$RUN_ROOT/run.env" <<EOF
-export BRANCH_CLEAN="$BRANCH_CLEAN"
-export VULNERABILITIES_FILE_PATH_CLEAN="$VULNERABILITIES_FILE_PATH_CLEAN"
+export REPOSITORY_URL_CLEAN="$AUTO_REPOSITORY_URL"
+export BRANCH_CLEAN="$AUTO_BRANCH"
+export VULNERABILITIES_FILE_PATH_CLEAN="$AUTO_VULNERABILITIES_FILE_PATH"
+export AUTO_BRANCH_SOURCE="$AUTO_BRANCH_SOURCE"
+export AUTO_VULNERABILITIES_FILE_PATH_SOURCE="$AUTO_VULNERABILITIES_FILE_PATH_SOURCE"
 EOF
 
-          VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
-          VULNS_JSON="$RUN_DIR/delta_vulns.json"
-          DELTA_ROW_COUNT="$($PYTHON_BIN - "$VULNS_FILE" "$VULNS_JSON" "$PROJECT_NAME" "$BRANCH_CLEAN" <<'PY'
-import csv
+              echo "Resolved BRANCH=$AUTO_BRANCH (source=$AUTO_BRANCH_SOURCE)"
+              echo "Resolved VULNERABILITIES_FILE_PATH=$AUTO_VULNERABILITIES_FILE_PATH (source=$AUTO_VULNERABILITIES_FILE_PATH_SOURCE)"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Check API Health') {
+      options { timeout(time: 5, unit: 'MINUTES') }
+      steps {
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          source "$RUN_ROOT/run.env"
+          curl --fail --silent --show-error "$API_BASE/health" \
+            | tee "$LOG_DIR/api_health.json" >/dev/null
+          echo "Backend health endpoint reachable: $API_BASE/health"
+        '''
+      }
+    }
+
+    stage('Build Code Index (API)') {
+      options { timeout(time: 240, unit: 'MINUTES') }
+      steps {
+        sh '''#!/usr/bin/env bash
+          set -euo pipefail
+          source "$RUN_ROOT/run.env"
+
+          curl --fail --silent --show-error "$API_BASE/indexes" -o "$RUN_DIR/indexes.json"
+
+            # Reuse an existing VM index when possible: explicit id takes priority.
+            # If explicit id is not found, fall back to project+branch matching.
+          IDX_SELECT="$($PYTHON_BIN - <<PY
 import json
 import re
 import sys
 from pathlib import Path
 
-csv_path = Path(sys.argv[1]).resolve()
-json_out = Path(sys.argv[2]).resolve()
-project_name = sys.argv[3]
-project_version = sys.argv[4]
+target = "${EXISTING_INDEX_ID_CLEAN}".strip()
+project = "${PROJECT_NAME}".strip()
+branch = "${BRANCH_CLEAN}".strip()
+repo_url = "${REPOSITORY_URL_CLEAN}".strip()
+data = json.loads(Path("$RUN_DIR/indexes.json").read_text(encoding="utf-8"))
+indexes = data.get("indexes") or []
 
-def _get(record, *keys):
-    normalized = {re.sub(r"[\\s_]+", "", str(key)).lower(): value for key, value in record.items()}
-    for key in keys:
-        value = normalized.get(re.sub(r"[\\s_]+", "", key).lower())
-        if value not in (None, ""):
-            return str(value).strip()
+picked = None
+reason = ""
+
+def norm(s: str) -> str:
+  return re.sub(r"[^A-Za-z0-9._-]+", "-", (s or "")).strip("-").lower()
+
+def idx_id(item: dict) -> str:
+  return (item.get("id") or item.get("index_id") or "").strip()
+
+def norm_git(u: str) -> str:
+  s = (u or "").strip().lower()
+  if not s:
     return ""
+  s = re.sub(r"^(ssh://)", "", s)
+  m = re.match(r"^(?:[^@]+@)?([^:/]+)[:/](.+)$", s)
+  if m:
+    host = m.group(1)
+    path = m.group(2)
+  else:
+    m = re.match(r"^https?://([^/]+)/(.+)$", s)
+    if m:
+      host = m.group(1)
+      path = m.group(2)
+    else:
+      return s[:-4] if s.endswith(".git") else s
+  path = path.strip("/")
+  if path.endswith(".git"):
+    path = path[:-4]
+  return f"{host}/{path}"
 
-def _float_or_none(value):
-    try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
+target_norm = norm(target)
+project_norm = norm(project)
+branch_norm = norm(branch)
 
-if not csv_path.exists():
-    raise SystemExit(f"CSV file not found: {csv_path}")
+if target:
+  picked = next((i for i in indexes if idx_id(i) == target), None)
+  if picked is None and target_norm:
+    picked = next((i for i in indexes if norm(idx_id(i)) == target_norm), None)
+  if picked is None:
+    print(f"WARNING: Requested EXISTING_INDEX_ID not found on backend VM: {target}", file=sys.stderr)
+    print("Known indexes from /indexes:", file=sys.stderr)
+    for i in indexes:
+      print(f"  - {idx_id(i)}", file=sys.stderr)
+    reason = "provided_missing"
+  else:
+    reason = "provided"
 
-with csv_path.open(encoding="utf-8-sig", newline="") as handle:
-    rows = list(csv.DictReader(handle))
+if picked is None:
+  # Primary auto-match: exact project+branch metadata.
+  repo_norm = norm_git(repo_url)
+  def repo_match(i: dict) -> bool:
+    g = norm_git(i.get("git_url") or "")
+    return (not repo_norm) or (g == repo_norm)
 
-findings = []
-for record in rows:
-    cve_id = _get(record, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
-    if not cve_id:
-        continue
-    findings.append(
-        {
-            "vulnerability": {
-                "vulnId": cve_id,
-                "severity": _get(record, "Severity") or "UNASSIGNED",
-                "description": _get(record, "Description"),
-                "source": _get(record, "Source") or "NVD",
-                "published": _get(record, "Published"),
-                "cwes": [
-                    cve.strip()
-                    for cve in re.split(r"[,;|]", _get(record, "CWE_IDs", "CWE"))
-                    if cve.strip()
-                ],
-                "cvssV3": _float_or_none(_get(record, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
-                "cvssV2": _float_or_none(_get(record, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
-                "epssScore": _float_or_none(_get(record, "EPSS_Score", "epss")),
-                "epssPercentile": _float_or_none(_get(record, "EPSS_Percentile", "epssPercentile")),
-                "references": None,
-            },
-            "component": {
-                "name": _get(record, "Component_Name", "ComponentName"),
-                "version": _get(record, "Component_Version", "ComponentVersion"),
-                "group": _get(record, "Component_Group", "ComponentGroup"),
-                "purl": _get(record, "purl", "PURL"),
-            },
-        }
+  matches = [
+    i for i in indexes
+    if (
+      ((i.get("project") or project) == project) and
+      ((i.get("branch") or "") == branch) and
+      repo_match(i)
     )
+  ]
+  if not matches:
+    # Fallback: normalized metadata match for branch naming differences.
+    matches = [
+      i for i in indexes
+      if (
+        (norm(i.get("project") or project) == project_norm) and
+        (norm(i.get("branch") or "") == branch_norm) and
+        repo_match(i)
+      )
+    ]
+  if not matches and project_norm and branch_norm:
+    # Final fallback: infer from index id pattern when branch metadata is absent/inconsistent.
+    matches = [
+      i for i in indexes
+      if (
+        norm(idx_id(i)).startswith(f"{project_norm}__") and
+        branch_norm in norm(idx_id(i)) and
+        repo_match(i)
+      )
+    ]
+  if matches:
+    matches.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
+    picked = matches[0]
+    reason = "auto"
 
-payload = {
-    "findings": findings,
-    "project": {
-        "name": project_name,
-        "version": project_version or None,
-        "uuid": None,
-    },
-}
-json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-print(len(rows))
+# Same-repo fallback: if no exact branch match, reuse the most recent index for
+# the same repository rather than triggering a new (potentially failing) build.
+if picked is None and repo_norm:
+  same_repo = [i for i in indexes if repo_match(i) and idx_id(i)]
+  if same_repo:
+    same_repo.sort(key=lambda i: float(i.get("updated_at") or 0.0), reverse=True)
+    picked = same_repo[0]
+    reason = "same_repo_fallback"
+    print(f"WARNING: no index for branch={branch!r}; reusing nearest same-repo index: {idx_id(picked)!r} (branch={picked.get('branch')!r})", file=sys.stderr)
+
+if picked:
+  print("true")
+  print(idx_id(picked))
+  print(picked.get("repo_root") or "")
+  print(reason)
+else:
+  print("false")
+  print("")
+  print("")
+  print("none")
+  print(f"DEBUG: no index matched and no same-repo fallback available. project={project!r} branch={branch!r} repo_norm={repo_norm!r}", file=sys.stderr)
+  print("DEBUG: known indexes on backend VM:", file=sys.stderr)
+  for i in indexes:
+    print(f"  id={idx_id(i)!r} project={i.get('project')!r} branch={i.get('branch')!r} git_url_norm={norm_git(i.get('git_url') or '')!r}", file=sys.stderr)
 PY
 )"
 
-          echo "Prepared delta payload for upload: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
+          REUSE_EXISTING="$(printf '%s\n' "$IDX_SELECT" | sed -n '1p')"
+          INDEX_ID="$(printf '%s\n' "$IDX_SELECT" | sed -n '2p')"
+          REPO_ROOT="$(printf '%s\n' "$IDX_SELECT" | sed -n '3p')"
+          REUSE_REASON="$(printf '%s\n' "$IDX_SELECT" | sed -n '4p')"
+
+            if [[ "$REUSE_EXISTING" == "true" ]]; then
+            if [[ -z "$INDEX_ID" ]]; then
+              echo "ERROR: existing index selection returned empty index id" >&2
+              exit 1
+            fi
+            cat >> "$RUN_ROOT/run.env" <<EOF
+export INDEX_ID="$INDEX_ID"
+export REPO_ROOT="$REPO_ROOT"
+EOF
+
+            if [[ "$REUSE_REASON" == "provided" ]]; then
+              echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
+              echo "Skipping /index/build because EXISTING_INDEX_ID was provided."
+            else
+              echo "Using existing index from backend VM: INDEX_ID=$INDEX_ID"
+              echo "Skipping /index/build because project+branch index already exists."
+            fi
+            echo "REPO_ROOT=$REPO_ROOT"
+            exit 0
+          fi
+
           INDEX_BUILD_PAYLOAD="$RUN_DIR/index_build_payload.json"
           "$PYTHON_BIN" - <<PY
 import json
@@ -518,8 +698,6 @@ EOF
         '''
       }
     }
-      }
-    }
 
     stage('Run Vulnerability Analysis (API)') {
       options { timeout(time: 240, unit: 'MINUTES') }
@@ -528,73 +706,18 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-            VULNS_FILE="${VULNERABILITIES_FILE_PATH_CLEAN}"
-            VULNS_JSON="$RUN_DIR/delta_vulns.json"
+          # Convert delta CSV to JSON (backend upload endpoint requires non-CSV extension).
+          VULNS_JSON="$RUN_DIR/delta_vulns.json"
           DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
-import csv
-import json
-import re
+import csv, json
 from pathlib import Path
-
-src = Path("$VULNS_FILE")
-rows = list(csv.DictReader(src.open(encoding="utf-8-sig")))
-
-def g(rec, *keys):
-    norm = {re.sub(r"[\\s_]+", "", str(k)).lower(): v for k, v in rec.items()}
-    for k in keys:
-        v = norm.get(re.sub(r"[\\s_]+", "", k).lower())
-        if v not in (None, ""):
-            return str(v).strip()
-    return ""
-
-def fnum(v):
-    try:
-        return float(v) if v not in (None, "") else None
-    except Exception:
-        return None
-
-findings = []
-for rec in rows:
-    cve_id = g(rec, "CVE_ID", "CVE-ID", "vulnId", "vulnerability")
-    if not cve_id:
-        continue
-    finding = {
-        "vulnerability": {
-            "vulnId": cve_id,
-            "severity": g(rec, "Severity") or "UNASSIGNED",
-            "description": g(rec, "Description"),
-            "source": g(rec, "Source") or "NVD",
-            "published": g(rec, "Published"),
-            "cwes": [c.strip() for c in re.split(r"[,;|]", g(rec, "CWE_IDs", "CWE")) if c.strip()],
-            "cvssV3": fnum(g(rec, "CVSS_v3_Score", "cvssV3", "CVSSv3")),
-            "cvssV2": fnum(g(rec, "CVSS_v2_Score", "cvssV2", "CVSSv2")),
-            "epssScore": fnum(g(rec, "EPSS_Score", "epss")),
-            "epssPercentile": fnum(g(rec, "EPSS_Percentile", "epssPercentile")),
-            "references": None,
-        },
-        "component": {
-            "name": g(rec, "Component_Name", "ComponentName"),
-            "version": g(rec, "Component_Version", "ComponentVersion"),
-            "group": g(rec, "Component_Group", "ComponentGroup"),
-            "purl": g(rec, "purl", "PURL"),
-        },
-    }
-    findings.append(finding)
-
-payload = {
-    "findings": findings,
-    "project": {
-        "name": "$PROJECT_NAME",
-        "version": "$BRANCH_CLEAN",
-        "uuid": None,
-    },
-}
-Path("$VULNS_JSON").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+rows = list(csv.DictReader(Path("${VULNERABILITIES_FILE_PATH_CLEAN}").open(encoding="utf-8-sig")))
+Path("$VULNS_JSON").write_text(json.dumps(rows, indent=2), encoding="utf-8")
 print(len(rows))
 PY
 )"
 
-            echo "Prepared delta payload for upload: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
+          echo "Converted delta CSV -> JSON: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
 
           if [[ "${DELTA_ROW_COUNT}" == "0" ]]; then
             cat >> "$RUN_ROOT/run.env" <<EOF
@@ -610,13 +733,11 @@ EOF
             exit 0
           fi
 
-          # Upload delta JSON to backend so it can access it on its own filesystem.
-          UPLOAD_FILE="$VULNS_JSON"
-
+          # Upload converted JSON to backend so it can access it on its own filesystem.
           UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
           UPLOAD_HTTP="$(curl --silent --show-error \
             -X POST "$API_BASE/jenkins/upload-sbom" \
-            -F "sbom_file=@${UPLOAD_FILE};filename=delta_vulns.json;type=application/json" \
+            -F "sbom_file=@${VULNS_JSON};type=application/json" \
             -o "$UPLOAD_BODY" \
             -w '%{http_code}')"
 
@@ -652,7 +773,7 @@ PY
 import json
 severities = [s.strip() for s in "${SEVERITIES}".split(",") if s.strip()]
 payload = {
-    "vulns_path": "${SERVER_VULNS_PATH}",
+  "vulns_path": "${SERVER_VULNS_PATH}",
     "severities": severities or ["CRITICAL", "HIGH"],
     "limit": int("${LIMIT}"),
     "mode": "${ANALYSIS_MODE}",
