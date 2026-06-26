@@ -19,6 +19,8 @@
     "bucket_name": "nios-dtrack-vuln-reports",
     "prefix": "",
     "aws_region": "us-west-1",
+    "baseline_csv_key": "NIOS_55375_9.2.0_55375_16-Jun-2026.csv",
+    "baseline_csv_local_path": "/import/ddi/gmattikalli/NIOS_55375_9.2.0_55375_16-Jun-2026.csv",
     "delta_output_subdir": "s3_delta",
     "state_file_name": ".last_processed_s3_file.json"
   }

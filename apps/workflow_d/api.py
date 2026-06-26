@@ -44,6 +44,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import ssl
@@ -1356,14 +1357,19 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 detail="full report not found (run must have completed via run_pipeline)",
             )
         try:
-            import sys as _sys
             root = str(Path(__file__).resolve().parents[2])
-            if root not in _sys.path:
-                _sys.path.insert(0, root)
+            if root not in sys.path:
+                sys.path.insert(0, root)
             from scripts.export_report_xlsx import build_workbook  # noqa: WPS433
         except Exception as exc:  # noqa: BLE001
+            py_exec = sys.executable
             raise HTTPException(
-                status_code=500, detail=f"export module unavailable: {exc}"
+                status_code=500,
+                detail=(
+                    "export module unavailable: "
+                    f"{exc} (python={py_exec}). "
+                    f"Install dependency with: {py_exec} -m pip install openpyxl"
+                ),
             ) from exc
         try:
             report = json.loads(full_path.read_text(encoding="utf-8"))

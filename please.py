@@ -55,6 +55,13 @@ def read_csv_from_s3(s3, bucket_name: str, key: str) -> Tuple[List[str], List[Di
     rows = list(reader)
     return headers, rows
 
+def read_csv_from_file(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
+    content = path.read_text(encoding="utf-8-sig")
+    reader = csv.DictReader(io.StringIO(content))
+    headers = reader.fieldnames or []
+    rows = list(reader)
+    return headers, rows
+
 def download_s3_file(s3, bucket_name: str, key: str, output_dir: Path) -> Path:
     destination = output_dir / Path(key).name
     s3.download_file(bucket_name, key, str(destination))
@@ -112,6 +119,21 @@ def main():
     parser.add_argument("--prefix", default=PREFIX, help="Optional S3 prefix")
     parser.add_argument("--state-file", default=None, help="Optional state file path")
     parser.add_argument("--aws-region", default=AWS_REGION, help="AWS region for S3")
+    parser.add_argument(
+        "--baseline-key",
+        default="",
+        help="Optional fixed baseline CSV key in S3. If set, each latest upload is compared against this baseline.",
+    )
+    parser.add_argument(
+        "--baseline-local-path",
+        default="",
+        help="Optional absolute local path to baseline CSV. If set, it takes precedence over --baseline-key.",
+    )
+    parser.add_argument(
+        "--latest-key",
+        default="",
+        help="Optional explicit latest CSV key to process (for trigger-captured uploads).",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -128,8 +150,42 @@ def main():
             print("No CSV files found in S3.")
             return
 
-        latest_obj = objects[-1]
-        previous_obj = objects[-2] if len(objects) >= 2 else None
+        objects_by_key = {obj["Key"]: obj for obj in objects}
+
+        latest_key_override = (args.latest_key or "").strip()
+        baseline_key_override = (args.baseline_key or "").strip()
+        baseline_local_path_override = (args.baseline_local_path or "").strip()
+
+        if latest_key_override:
+            latest_obj = objects_by_key.get(latest_key_override)
+            if latest_obj is None:
+                raise RuntimeError(
+                    f"Configured latest key not found in S3 listing: {latest_key_override}"
+                )
+        else:
+            latest_obj = objects[-1]
+
+        previous_obj = None
+        previous_rows = None
+        if baseline_local_path_override:
+            baseline_local_path = Path(baseline_local_path_override)
+            if not baseline_local_path.is_absolute():
+                raise RuntimeError(
+                    f"Configured baseline local path must be absolute: {baseline_local_path_override}"
+                )
+            if not baseline_local_path.exists():
+                raise RuntimeError(
+                    f"Configured baseline local file not found: {baseline_local_path}"
+                )
+            _, previous_rows = read_csv_from_file(baseline_local_path)
+        elif baseline_key_override:
+            previous_obj = objects_by_key.get(baseline_key_override)
+            if previous_obj is None:
+                raise RuntimeError(
+                    f"Configured baseline key not found in S3 listing: {baseline_key_override}"
+                )
+        elif len(objects) >= 2:
+            previous_obj = objects[-2]
 
         latest_key = latest_obj["Key"]
         latest_etag = latest_obj["ETag"]
@@ -146,14 +202,20 @@ def main():
             print("Latest CSV has no headers.")
             return
 
-        if previous_obj is None:
+        if previous_rows is None and previous_obj is None:
             delta_rows = []
             print("Only one CSV exists in S3, so there is no previous file to compare against.")
         else:
-            previous_key = previous_obj["Key"]
-            _, previous_rows = read_csv_from_s3(s3, args.bucket_name, previous_key)
+            if previous_rows is None:
+                previous_key = previous_obj["Key"]
+                _, previous_rows = read_csv_from_s3(s3, args.bucket_name, previous_key)
             delta_rows = find_new_rows(previous_rows, latest_rows, latest_headers)
-            print(f"Compared latest file '{latest_key}' against previous file '{previous_key}'")
+            if baseline_local_path_override:
+                print(f"Compared latest file '{latest_key}' against fixed local baseline file '{baseline_local_path_override}'")
+            elif baseline_key_override:
+                print(f"Compared latest file '{latest_key}' against fixed baseline file '{previous_key}'")
+            else:
+                print(f"Compared latest file '{latest_key}' against previous file '{previous_key}'")
             print(f"New CVEs found: {len(delta_rows)}")
 
         delta_file = output_dir / f"new_cves_{Path(latest_key).stem}.csv"

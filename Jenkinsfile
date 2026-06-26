@@ -7,7 +7,7 @@ pipeline {
     timestamps()
     disableConcurrentBuilds()
     skipDefaultCheckout(true)
-    timeout(time: 600, unit: 'MINUTES')
+    timeout(time: 720, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '30'))
   }
 
@@ -20,7 +20,7 @@ pipeline {
     string(name: 'BRANCH', defaultValue: '', description: 'Optional manual override. If empty, branch is auto-resolved from upstream Jenkins console and falls back to develop/9.2.')
     string(name: 'VULNERABILITIES_FILE_PATH', defaultValue: '', description: 'Optional manual override. If empty, auto-generated delta CSV from latest S3 upload is used.')
     string(name: 'EXISTING_INDEX_ID', defaultValue: '', description: 'Optional: existing index id on backend VM (if provided and found, /index/build is skipped).')
-    string(name: 'API_BASE_URL', defaultValue: 'http://10.120.23.89:8088', description: 'Backend API base URL reachable from Jenkins.')
+    string(name: 'API_BASE_URL', defaultValue: 'http://10.120.23.228:18088', description: 'Backend API base URL reachable from Jenkins.')
     string(name: 'AUTOMATION_CONFIG_PATH', defaultValue: 'configs/jenkins_automation.json', description: 'Config file for branch/S3 automation settings.')
     string(name: 'JENKINS_API_CREDENTIALS_ID', defaultValue: 'jenkins-api-user-token', description: 'Credentials ID (username/password or username/token) for upstream Jenkins API auth.')
     string(name: 'AWS_S3_CREDENTIALS_ID', defaultValue: 'aws-s3-access-key-secret', description: 'Credentials ID (username=AWS access key, password=AWS secret key) for S3 read/list access.')
@@ -181,7 +181,7 @@ EOF
               fi
 
               if [[ "$TRIGGER_MODE" == "manual" ]]; then
-                echo "Manual trigger detected. Skipping S3 polling gate and continuing with latest-2 S3 resolution."
+                echo "Manual trigger detected. Skipping S3 polling gate and continuing with configured S3 baseline resolution."
                 exit 0
               fi
 
@@ -388,7 +388,7 @@ EOF
     }
 
     stage('Build Code Index (API)') {
-      options { timeout(time: 240, unit: 'MINUTES') }
+      options { timeout(time: 720, unit: 'MINUTES') }
       steps {
         sh '''#!/usr/bin/env bash
           set -euo pipefail
@@ -700,7 +700,7 @@ EOF
     }
 
     stage('Run Vulnerability Analysis (API)') {
-      options { timeout(time: 240, unit: 'MINUTES') }
+      options { timeout(time: 720, unit: 'MINUTES') }
       steps {
         sh '''#!/usr/bin/env bash
           set -euo pipefail

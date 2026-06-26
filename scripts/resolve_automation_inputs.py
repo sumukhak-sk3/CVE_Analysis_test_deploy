@@ -197,6 +197,9 @@ def _resolve_delta_vuln_path(
 
     prefix = _trim(s3_cfg.get("prefix", ""))
     aws_region = _trim(s3_cfg.get("aws_region", "us-west-1"))
+    baseline_csv_key = _trim(s3_cfg.get("baseline_csv_key", ""))
+    baseline_csv_local_path = _trim(s3_cfg.get("baseline_csv_local_path", ""))
+    latest_key_override = _trim(os.getenv("DETECTED_S3_KEY"))
     delta_subdir = _trim(s3_cfg.get("delta_output_subdir", "s3_delta"))
     state_file_name = _trim(s3_cfg.get("state_file_name", ".last_processed_s3_file.json"))
 
@@ -229,6 +232,12 @@ def _resolve_delta_vuln_path(
         "--aws-region",
         aws_region,
     ]
+    if baseline_csv_key:
+        cmd += ["--baseline-key", baseline_csv_key]
+    if baseline_csv_local_path:
+        cmd += ["--baseline-local-path", baseline_csv_local_path]
+    if latest_key_override:
+        cmd += ["--latest-key", latest_key_override]
 
     completed = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if completed.stdout:
