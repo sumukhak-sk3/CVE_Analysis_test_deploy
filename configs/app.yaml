@@ -6,7 +6,7 @@ service:
   port: 8088
   log_level: INFO
   cors_origins:
-    - http://10.120.23.89:5173
+    - http://10.120.23.228:5173
     - http://localhost:5173
     - http://127.0.0.1:5173
 
@@ -91,8 +91,8 @@ jenkins:
   api_token: ${JENKINS_API_TOKEN:-1130cdd1a1b8b6189e2718c1d5058ebdbe}
   # trigger_token: ${JENKINS_TRIGGER_TOKEN:-}
   # Public API base Jenkins can reach to download uploaded SBOMs.
-  # Example: http://10.120.23.89:8088
-  public_api_base: ${PUBLIC_API_BASE_URL:-http://10.120.23.89:8088}
+  # Example: http://10.120.23.228:18088
+  public_api_base: ${PUBLIC_API_BASE_URL:-http://10.120.23.228:18088}
   # Defaults for pipeline parameters.
   second_service_api_url: ${SECOND_SERVICE_API_URL:-}
   analysis_repo_root: ${ANALYSIS_REPO_ROOT:-}
