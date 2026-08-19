@@ -6,7 +6,7 @@ export default function JenkinsPage() {
   const [jenkinsUrl, setJenkinsUrl] = useState("");
   const [jobName, setJobName] = useState("");
   const [dtrackUrl, setDtrackUrl] = useState("http://localhost:8081");
-  const [analysisApiUrl, setAnalysisApiUrl] = useState("http://10.120.23.89:8088");
+  const [analysisApiUrl, setAnalysisApiUrl] = useState("http://10.120.23.228:18088");
   const [repoRoot, setRepoRoot] = useState("");
   const [waitMinutes, setWaitMinutes] = useState("30");
   const [severities, setSeverities] = useState("CRITICAL,HIGH");
@@ -99,7 +99,7 @@ export default function JenkinsPage() {
             <input
               value={analysisApiUrl}
               onChange={(e) => setAnalysisApiUrl(e.target.value)}
-              placeholder="http://10.120.23.89:8088"
+              placeholder="http://10.120.23.228:18088"
               style={{ width: "100%" }}
             />
           </div>
