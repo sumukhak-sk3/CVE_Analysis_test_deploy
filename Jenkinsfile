@@ -706,18 +706,16 @@ EOF
           set -euo pipefail
           source "$RUN_ROOT/run.env"
 
-          # Convert delta CSV to JSON (backend upload endpoint requires non-CSV extension).
-          VULNS_JSON="$RUN_DIR/delta_vulns.json"
+          # Count rows to check for empty delta (upload CSV directly — backend accepts .csv natively).
           DELTA_ROW_COUNT="$($PYTHON_BIN - <<PY
-import csv, json
+import csv
 from pathlib import Path
 rows = list(csv.DictReader(Path("${VULNERABILITIES_FILE_PATH_CLEAN}").open(encoding="utf-8-sig")))
-Path("$VULNS_JSON").write_text(json.dumps(rows, indent=2), encoding="utf-8")
 print(len(rows))
 PY
 )"
 
-          echo "Converted delta CSV -> JSON: ${DELTA_ROW_COUNT} rows -> $VULNS_JSON"
+          echo "Delta CSV: ${DELTA_ROW_COUNT} rows -> ${VULNERABILITIES_FILE_PATH_CLEAN}"
 
           if [[ "${DELTA_ROW_COUNT}" == "0" ]]; then
             cat >> "$RUN_ROOT/run.env" <<EOF
@@ -737,7 +735,7 @@ EOF
           UPLOAD_BODY="$RUN_DIR/upload_sbom_response.json"
           UPLOAD_HTTP="$(curl --silent --show-error \
             -X POST "$API_BASE/jenkins/upload-sbom" \
-            -F "sbom_file=@${VULNS_JSON};type=application/json" \
+            -F "sbom_file=@${VULNERABILITIES_FILE_PATH_CLEAN};type=text/csv" \
             -o "$UPLOAD_BODY" \
             -w '%{http_code}')"
 
